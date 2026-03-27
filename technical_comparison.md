@@ -15,8 +15,8 @@ Based on benchmarks with **Qwen-3.5 2B** (MLA architecture) on NVIDIA H100:
 | Strategy | Latency (ms/layer) | Cosine Similarity (Fidelity) | Accuracy Status |
 | :--- | :---: | :---: | :---: |
 | **Gaussian 1-bit** | **0.80 ms** | 0.9736 | Noisy |
-| **Kudahitam 1-bit** | **1.16 ms** | **0.9898** | **High Fidelity** |
-| **Kudahitam 3-bit** | **1.10 ms** | **0.9991** | **Quality Neutral** |
+| **KudaHitamQuant 1-bit** | **1.16 ms** | **0.9898** | **High Fidelity** |
+| **KudaHitamQuant 3-bit** | **1.10 ms** | **0.9991** | **Quality Neutral** |
 
 ## 3. Why FWHT is Superior?
 In the traditional dense approach, every KV-cache compression required a large $D \times D$ matrix multiplication. This not only consumed GPU compute cycles but also introduced significant memory-access overhead for the large projection matrix.

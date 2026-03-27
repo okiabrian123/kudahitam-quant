@@ -1,6 +1,6 @@
 # KudaHitamQuant: Ultra-High Fidelity 1-bit KV Cache Compression via Structured Orthogonal Projections
 
-**Authors**: Abrian, Kudahitam Research Team
+**Authors**: Abrian, KudaHitamQuant Research Team
 **Date**: March 2026
 
 ---
@@ -49,7 +49,7 @@ Measured on NVIDIA H100 with $D=256$.
 | Bit-rate | Strategy | Acc (Fidelity) | Latency (ms/layer) |
 | :--- | :--- | :---: | :---: |
 | 16.0-bit | Full FP16 (Baseline) | 1.0000 | 15.52 |
-| 3.0-bit | **Kudahitam (Neutral)** | **0.9991** | **1.10** |
+| 3.0-bit | **KudaHitamQuant (Neutral)** | **0.9991** | **1.10** |
 | 2.0-bit | **KudaHitamQuant** | **0.9967** | **1.09** |
 | 1.0-bit | **KudaHitamQuant** | **0.9898** | **1.16** |
 | 1.0-bit | Gaussian Baseline | 0.9736 | 0.80 |

@@ -18,7 +18,7 @@ The following evaluations were performed on an NVIDIA H100 GPU using the **Qwen-
 | Strategy | Bit-rate | Acc (Fidelity) | Latency (ms/layer) |
 | :--- | :---: | :---: | :---: |
 | Google TurboQuant (Neutral) | 3.5 | ~1.0000 | 2.10 |
-| **Kudahitam (Neutral)** | **3.0** | **0.9991** | **1.10** |
+| **KudaHitamQuant (Neutral)** | **3.0** | **0.9991** | **1.10** |
 | **KudaHitamQuant** | **2.0** | **0.9967** | **1.09** |
 | **KudaHitamQuant** | **1.0** | **0.9898** | **1.16** |
 | Gaussian 1-bit QJL | 1.0 | 0.9736 | 0.80 |
@@ -27,14 +27,14 @@ Note: **3.0-bit** reaches "Quality Neutrality" (0.999+ fidelity).
 
 ## Repository Structure
 
-- `kudahitam_qwen3_5_full.py`: The core engine containing the Triton kernels and the Qwen-3.5 benchmark suite.
+- `KudaHitamQuant_qwen3_5_full.py`: The core engine containing the Triton kernels and the Qwen-3.5 benchmark suite.
 - `technical_comparison.md`: Detailed mathematical breakdown of FWHT vs Gaussian projections.
-- `kudahitam_quant_paper_draft.md`: Full research manuscript draft.
-- `kudahitam_quant_paper.tex`: LaTeX source for arXiv submission.
+- `KudaHitamQuant_quant_paper_draft.md`: Full research manuscript draft.
+- `KudaHitamQuant_quant_paper.tex`: LaTeX source for arXiv submission.
 
 ## Quick Start
 1. Ensure you have PyTorch and Triton installed.
 2. Run the benchmark:
 ```bash
-python kudahitam_qwen3_5_full.py
+python KudaHitamQuant_qwen3_5_full.py
 ```
