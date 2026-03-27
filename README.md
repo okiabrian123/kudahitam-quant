@@ -27,14 +27,14 @@ Note: **3.0-bit** reaches "Quality Neutrality" (0.999+ fidelity).
 
 ## Repository Structure
 
-- `KudaHitamQuant_qwen3_5_full.py`: The core engine containing the Triton kernels and the Qwen-3.5 benchmark suite.
+- `KudaHitamQuant_full.py`: The core engine containing the Triton kernels and the Qwen-3.5 benchmark suite.
 - `technical_comparison.md`: Detailed mathematical breakdown of FWHT vs Gaussian projections.
-- `KudaHitamQuant_quant_paper_draft.md`: Full research manuscript draft.
-- `KudaHitamQuant_quant_paper.tex`: LaTeX source for arXiv submission.
+- `KudaHitamQuant_paper_draft.md`: Full research manuscript draft.
+- `KudaHitamQuant_paper.tex`: LaTeX source for arXiv submission.
 
 ## Quick Start
 1. Ensure you have PyTorch and Triton installed.
 2. Run the benchmark:
 ```bash
-python KudaHitamQuant_qwen3_5_full.py
+python KudaHitamQuant_full.py
 ```
