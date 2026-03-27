@@ -1,0 +1,10 @@
+torch>=2.4.0
+transformers>=5.0.0
+# atau gunakan: transformers @ git+https://github.com/huggingface/transformers.git
+accelerate>=1.1.0
+bitsandbytes>=0.43.0
+scipy
+matplotlib
+numpy
+tqdm
+einops
