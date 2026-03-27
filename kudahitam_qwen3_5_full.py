@@ -1,5 +1,5 @@
 """
-Kudahitam-Quant KV cache v2: Asymmetric attention with Triton Optimization (Pure Multi-Pass).
+KudaHitamQuant KV cache v2: Asymmetric attention with Triton Optimization (Pure Multi-Pass).
 """
 import os
 import sys
@@ -225,7 +225,7 @@ def main():
     
     print("-" * 150); print(f"{'Context':8s} | {'Bits':10s} | {'Acc (F)':10s} | {'Acc (G)':10s} | {'Comp(F) ms':12s} | {'Comp(G) ms':12s}")
     for ctx in [10000, 40000]:
-        prompt = f"Quantum memory optimization session. Standardizing the KV cache for very long context window. " + "Context injection: The primary method is Kudahitam-Quant using Triton-optimized Multi-Pass FWHT. " * (ctx // 100)
+        prompt = f"Quantum memory optimization session. Standardizing the KV cache for very long context window. " + "Context injection: The primary method is KudaHitamQuant using Triton-optimized Multi-Pass FWHT. " * (ctx // 100)
         in_ids = tok(prompt + " Question: What is the primary method?", return_tensors="pt").input_ids.to(model.device); pkv = None
         with torch.no_grad():
             for i in range(0, in_ids.shape[1], 2048): out = model(in_ids[:, i:i+2048], past_key_values=pkv, use_cache=True); pkv = out.past_key_values

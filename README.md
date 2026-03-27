@@ -1,6 +1,6 @@
-# Kudahitam-Quant: Ultra-High Fidelity 1-bit KV Compression for Qwen-3.5 MLA
+# KudaHitamQuant: Ultra-High Fidelity 1-bit KV Compression for Qwen-3.5 MLA
 
-**Kudahitam-Quant** is a high-performance KV-cache compression framework specifically designed for the **Multi-Head Latent Attention (MLA)** architecture of **Qwen-3.5 2B**. Unlike Qwen-2, Qwen-3.5 introduces significant architectural improvements in latent representation, making extreme 1-bit compression both more challenging and more rewarding.
+**KudaHitamQuant** is a high-performance KV-cache compression framework specifically designed for the **Multi-Head Latent Attention (MLA)** architecture of **Qwen-3.5 2B**. Unlike Qwen-2, Qwen-3.5 introduces significant architectural improvements in latent representation, making extreme 1-bit compression both more challenging and more rewarding.
 
 This repository implements **Fast Walsh-Hadamard Transform (FWHT) Structured Projections** to achieve near-lossless fidelity (0.99+) at extreme bit-rates.
 
@@ -19,8 +19,8 @@ The following evaluations were performed on an NVIDIA H100 GPU using the **Qwen-
 | :--- | :---: | :---: | :---: |
 | Google TurboQuant (Neutral) | 3.5 | ~1.0000 | 2.10 |
 | **Kudahitam (Neutral)** | **3.0** | **0.9991** | **1.10** |
-| **Kudahitam-Quant** | **2.0** | **0.9967** | **1.09** |
-| **Kudahitam-Quant** | **1.0** | **0.9898** | **1.16** |
+| **KudaHitamQuant** | **2.0** | **0.9967** | **1.09** |
+| **KudaHitamQuant** | **1.0** | **0.9898** | **1.16** |
 | Gaussian 1-bit QJL | 1.0 | 0.9736 | 0.80 |
 
 Note: **3.0-bit** reaches "Quality Neutrality" (0.999+ fidelity).
