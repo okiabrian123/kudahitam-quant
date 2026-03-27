@@ -46,13 +46,17 @@ We benchmark against the official industry standard for 1-bit KV quantization: G
 ### 3.2 Performance on Qwen-3.5 2B (40k Context)
 Measured on NVIDIA T4 with $D=256$.
 
-| Bit-rate | Strategy | Acc (Fidelity) | Latency (ms/layer) |
-| :--- | :--- | :---: | :---: |
-| 16.0-bit | Full FP16 (Baseline) | 1.0000 | 15.52 |
-| 3.0-bit | **KudaHitamQuant (Neutral)** | **0.9991** | **1.10** |
-| 2.0-bit | **KudaHitamQuant** | **0.9967** | **1.09** |
-| 1.0-bit | **KudaHitamQuant** | **0.9898** | **1.16** |
-| 1.0-bit | Gaussian Baseline | 0.9736 | 0.80 |
+| Context | Bits | Acc (F) | Acc (G) | Comp(F) ms | Comp(G) ms |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| 10,000 | 1-bit QJL | 0.9941 | 0.9852 | 1.12 | 0.79 |
+| 10,000 | 2-bit QJL | 0.9981 | 0.9949 | 1.05 | 0.78 |
+| 10,000 | 3-bit QJL | 0.9994 | 0.9985 | 1.07 | 0.81 |
+| 40,000 | 1-bit QJL | 0.9905 | 0.9752 | 1.19 | 0.83 |
+| 40,000 | 2-bit QJL | 0.9969 | 0.9915 | 1.07 | 0.85 |
+| 40,000 | 3-bit QJL | 0.9991 | 0.9975 | 1.16 | 0.81 |
+| 104,000 | 1-bit QJL | 0.9890 | 0.9720 | 1.19 | 0.83 |
+| 104,000 | 2-bit QJL | 0.9964 | 0.9903 | 1.12 | 0.82 |
+| 104,000 | 3-bit QJL | 0.9989 | 0.9971 | 1.14 | 0.81 |
 
 ## 4. Discussion: Memory-Efficient Training
 Beyond inference, the extreme sample-efficiency of FWHT projections enables **KudaHitamQuant-Training**. By using a **Straight-Through Estimator (STE)**, researchers can conduct KV-activation compression during the forward pass, reducing activation memory by 8-16x. This allows training massive context sequences on existing hardware without the quadratic memory trap of latent activations.

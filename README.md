@@ -15,13 +15,17 @@ This repository implements **Fast Walsh-Hadamard Transform (FWHT) Structured Pro
 
 The following evaluations were performed on an NVIDIA T4 and CPU offloading using the **Qwen-3.5 2B** model ($D=256$, H=16, 40k Context).
 
-| Strategy | Bit-rate | Acc (Fidelity) | Latency (ms/layer) |
-| :--- | :---: | :---: | :---: |
-| Google TurboQuant (Neutral) | 3.5 | ~1.0000 | 2.10 |
-| **KudaHitamQuant (Neutral)** | **3.0** | **0.9991** | **1.10** |
-| **KudaHitamQuant** | **2.0** | **0.9967** | **1.09** |
-| **KudaHitamQuant** | **1.0** | **0.9898** | **1.16** |
-| Gaussian 1-bit QJL | 1.0 | 0.9736 | 0.80 |
+| Context | Bits | Acc (F) | Acc (G) | Comp(F) ms | Comp(G) ms |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| 10,000 | 1-bit QJL | 0.9941 | 0.9852 | 1.12 | 0.79 |
+| 10,000 | 2-bit QJL | 0.9981 | 0.9949 | 1.05 | 0.78 |
+| 10,000 | 3-bit QJL | 0.9994 | 0.9985 | 1.07 | 0.81 |
+| 40,000 | 1-bit QJL | 0.9905 | 0.9752 | 1.19 | 0.83 |
+| 40,000 | 2-bit QJL | 0.9969 | 0.9915 | 1.07 | 0.85 |
+| 40,000 | 3-bit QJL | 0.9991 | 0.9975 | 1.16 | 0.81 |
+| 104,000 | 1-bit QJL | 0.9890 | 0.9720 | 1.19 | 0.83 |
+| 104,000 | 2-bit QJL | 0.9964 | 0.9903 | 1.12 | 0.82 |
+| 104,000 | 3-bit QJL | 0.9989 | 0.9971 | 1.14 | 0.81 |
 
 Note: **3.0-bit** reaches "Quality Neutrality" (0.999+ fidelity).
 

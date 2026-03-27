@@ -39,17 +39,23 @@ We implement the FWHT stages in Triton using bitwise operators for indexing, eli
 This ensures coordinate mapping executes in a single CUDA cycle on T4 hardware.
 
 \section{Experimental Analysis}
-\begin{table}[h]
+\begin{table*}[t]
 \centering
-\caption{Comparison vs. Google TurboQuant}
-\begin{tabular}{@{}lcc@{}}
+\caption{Reconstruction Fidelity and Latency on NVIDIA T4 (Qwen-3.5 2B)}
+\begin{tabular}{@{}lccccc@{}}
 \toprule
-Metric & Google TurboQuant & \textbf{KudaHitamQuant} \\ \midrule
-Neutrality Bit-rate & 3.5 bits & \textbf{3.0 bits} \\
-Complexity & $O(D^2)$ & \textbf{$O(D \log D)$} \\
-Indexing & Standard & \textbf{Bitwise} \\ \bottomrule
+Context & Bits & Acc (F) & Acc (G) & Comp(F) ms & Comp(G) ms \\ \midrule
+10k & 1-bit QJL & 0.9941 & 0.9852 & 1.12 & 0.79 \\
+10k & 2-bit QJL & 0.9981 & 0.9949 & 1.05 & 0.78 \\
+10k & 3-bit QJL & 0.9994 & 0.9985 & 1.07 & 0.81 \\ \cmidrule{1-6}
+40k & 1-bit QJL & 0.9905 & 0.9752 & 1.19 & 0.83 \\
+40k & 2-bit QJL & 0.9969 & 0.9915 & 1.07 & 0.85 \\
+40k & 3-bit QJL & 0.9991 & 0.9975 & 1.16 & 0.81 \\ \cmidrule{1-6}
+104k & 1-bit QJL & 0.9890 & 0.9720 & 1.19 & 0.83 \\
+104k & 2-bit QJL & 0.9964 & 0.9903 & 1.12 & 0.82 \\
+104k & 3-bit QJL & 0.9989 & 0.9971 & 1.14 & 0.81 \\ \bottomrule
 \end{tabular}
-\end{table}
+\end{table*}
 
 \section{Discussion: Training Application}
 By using a \textbf{Straight-Through Estimator (STE)}, KudaHitamQuant enables KV-activation compression during the forward pass of training, reducing activation memory by 8-16x and enabling training on 1M+ sequences.
