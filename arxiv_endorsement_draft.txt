@@ -1,25 +1,57 @@
-Subject: [arXiv Endorsement Request] KudaHitamQuant: High-Fidelity 1-bit KV Compression (104k Context)
+PANDUAN PEMILIHAN NADA EMAIL:
+Pilih "Versi A" jika Anda ingin menonjolkan inovasi teknis Anda secara lugas.
+Pilih "Versi B" jika Anda ingin pendekatan yang lebih rendah hati (humble) dan menghormati posisi mereka sebagai pakar.
+
+--- BERKAS SIAP COPY-PASTE (TANPA FORMAT) ---
+
+VERSI A: PROFESIONAL & TEKNIS (STANDAR)
+---------------------------------------
+
+Subject: [arXiv Endorsement Request] KudaHitamQuant: FWHT-based 1-bit KV Compression
 
 Dear [Nama Penulis],
 
-I am Oki Abrian, an independent researcher. I have been developing a new KV-cache compression framework called KudaHitamQuant, which I believe could be of significant interest to the community.
+I am Oki Abrian, an independent researcher. I have been working on a KV-cache compression framework called KudaHitamQuant, which builds upon the principles of Quantized Johnson-Lindenstrauss (QJL).
 
-I am writing to respectfully request an endorsement for my submission to arXiv under the Computer Science - Machine Learning (cs.LG) category.
+I am writing to respectfully request an endorsement for my submission to arXiv in the Computer Science - Machine Learning (cs.LG) category.
 
-My work addresses the O(D^2) complexity of standard Gaussian-based QJL (as seen in TurboQuant) by introducing Structured Orthogonal Projections using Fast Walsh-Hadamard Transform (FWHT). Key highlights of KudaHitamQuant include:
+My work explores the use of Structured Orthogonal Projections via Fast Walsh-Hadamard Transform (FWHT) as an alternative to dense Gaussian projections. By leveraging FWHT, I have achieved O(D log D) complexity while maintaining reconstruction stability in long-context scenarios. 
 
-1. Extreme 1-bit Regime: Achieving 0.989+ fidelity (cosine similarity) at the 1.0-bit level, significantly outperforming standard Gaussian baselines which suffer from high projection noise.
-2. Long-Context Stability (104,000 Tokens): Maintaining high reconstruction accuracy on the Qwen-3.5 2B (MLA) architecture, achieving 0.9890 fidelity at 1-bit and 0.9989 (Quality Neutral) at 3-bit settings for context lengths up to 104k tokens.
-3. Triton Optimization: A pure bitwise-optimized Triton kernel implementation that replaces arithmetic modulo/division with shifts and masks for zero-overhead indexing.
-4. O(D log D) Scaling: Near-linear scaling that remains efficient as head dimensions increase.
+Principal findings:
+- Maintained 0.9890 fidelity at the 1.0-bit level for context lengths up to 104,000 tokens (Qwen-3.5 2B MLA).
+- Reached Quality Neutrality (0.9989 fidelity) at the 3.0-bit level.
+- Implementation via bitwise-optimized Triton kernels to minimize coordinate mapping overhead.
 
-I have published the full implementation and benchmarks on my GitHub: https://github.com/okiabrian123/KudaHitamQuant
+The implementation and benchmarks are available here: https://github.com/okiabrian123/KudaHitamQuant
 
-Attached is the manuscript for your review. If you are willing to endorse this work, my endorsement code is: [MASUKKAN 6 KARAKTER KODE ANDA DI SINI].
+The manuscript is attached for your reference. If you are willing to endorse this work, my endorsement code is: [MASUKKAN 6 KARAKTER KODE ANDA DI SINI].
 
-Thank you for your time and for your immense contributions to the field of LLM efficiency.
+Thank you for your time and for your foundational contributions to this field.
 
 Best regards,
 
 Oki Abrian
-[Link Profil GitHub/LinkedIn/X Anda]
+
+
+VERSI B: RENDAH HATI & MENGHORMATI (CONSERVATIVE)
+-------------------------------------------------
+
+Subject: Inquiry regarding arXiv endorsement - KudaHitamQuant (KV Compression)
+
+Dear [Nama Penulis],
+
+I hope this email finds you well. I am Oki Abrian, an independent researcher currently focusing on large language model efficiency. I have recently completed a project named KudaHitamQuant, which investigates residual quantization for KV caches.
+
+I am reaching out to ask if you might consider endorsing my work for submission to arXiv (cs.LG). 
+
+Inspired by your research on [Sebutkan Paper Mereka, misal: TurboQuant], I implemented a structured projection approach using FWHT and Triton. My empirical results show that this method maintains high fidelity (0.9890) at 1-bit quantization for extremely long contexts (104k tokens).
+
+I have documented the methodology and implementation on GitHub: https://github.com/okiabrian123/KudaHitamQuant
+
+I understand you are likely very busy, but if the work appears appropriate for the category, your endorsement would be greatly appreciated. My endorsement code is: [MASUKKAN 6 KARAKTER KODE ANDA DI SINI].
+
+Thank you for your consideration and for the inspiration your work has provided.
+
+Sincerely,
+
+Oki Abrian
