@@ -1,0 +1,25 @@
+Subject: [arXiv Endorsement Request] KudaHitamQuant: High-Fidelity 1-bit KV Compression (104k Context)
+
+Dear [Nama Penulis],
+
+I am Oki Abrian, an independent researcher. I have been developing a new KV-cache compression framework called KudaHitamQuant, which I believe could be of significant interest to the community.
+
+I am writing to respectfully request an endorsement for my submission to arXiv under the Computer Science - Machine Learning (cs.LG) category.
+
+My work addresses the O(D^2) complexity of standard Gaussian-based QJL (as seen in TurboQuant) by introducing Structured Orthogonal Projections using Fast Walsh-Hadamard Transform (FWHT). Key highlights of KudaHitamQuant include:
+
+1. Extreme 1-bit Regime: Achieving 0.989+ fidelity (cosine similarity) at the 1.0-bit level, significantly outperforming standard Gaussian baselines which suffer from high projection noise.
+2. Long-Context Stability (104,000 Tokens): Maintaining high reconstruction accuracy on the Qwen-3.5 2B (MLA) architecture, achieving 0.9890 fidelity at 1-bit and 0.9989 (Quality Neutral) at 3-bit settings for context lengths up to 104k tokens.
+3. Triton Optimization: A pure bitwise-optimized Triton kernel implementation that replaces arithmetic modulo/division with shifts and masks for zero-overhead indexing.
+4. O(D log D) Scaling: Near-linear scaling that remains efficient as head dimensions increase.
+
+I have published the full implementation and benchmarks on my GitHub: https://github.com/okiabrian123/KudaHitamQuant
+
+Attached is the manuscript for your review. If you are willing to endorse this work, my endorsement code is: [MASUKKAN 6 KARAKTER KODE ANDA DI SINI].
+
+Thank you for your time and for your immense contributions to the field of LLM efficiency.
+
+Best regards,
+
+Oki Abrian
+[Link Profil GitHub/LinkedIn/X Anda]
