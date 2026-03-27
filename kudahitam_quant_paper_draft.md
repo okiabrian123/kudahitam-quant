@@ -6,7 +6,7 @@
 ---
 
 ## Abstract
-Large Language Models (LLMs) with long context windows are bottlenecked by memory and computational overhead of the Key-Value (KV) cache. While Multi-Head Latent Attention (MLA) reduces this burden, further extreme compression is needed for production scalability. This paper introduces **Kudahitam-Quant**, a high-fidelity 1-bit/2-bit quantization framework for KV cache residuals. By leveraging **Fast Walsh-Hadamard Transform (FWHT)**, we reduce projection complexity from $O(D^2)$ to $O(D \log D)$ while achieving superior reconstruction fidelity (0.99+ cosine similarity) compared to traditional Gaussian projections. We further optimize performance using **Bitwise-Optimized Triton Kernels**, eliminating expensive integer arithmetic at the CUDA level. Benchmarks on Qwen-3.5 2B show that **Kudahitam-Quant** preserves context integrity up to 40,000 tokens with extreme memory efficiency, matching the quality of higher-bit baselines like Google's TurboQuant (at 3.5 bits) while operating in the extreme 1.0-bit regime with 0.99+ fidelity.
+Large Language Models (LLMs) with long context windows are bottlenecked by memory and computational overhead of the Key-Value (KV) cache. While Multi-Head Latent Attention (MLA) reduces this burden, further extreme compression is needed for production scalability. This paper introduces **Kudahitam-Quant**, a high-fidelity 1-bit/2-bit quantization framework for KV cache residuals. By leveraging **Fast Walsh-Hadamard Transform (FWHT)**, we reduce projection complexity from $O(D^2)$ to $O(D \log D)$ while achieving superior reconstruction fidelity (0.99+ cosine similarity) compared to traditional Gaussian projections. We further optimize performance using **Bitwise-Optimized Triton Kernels**, eliminating expensive integer arithmetic at the CUDA level. Benchmarks on **Qwen-3.5 2B** show that **Kudahitam-Quant** preserves context integrity up to 40,000 tokens with extreme memory efficiency, matching the quality of higher-bit baselines like Google's TurboQuant (at 3.5 bits) while operating in the extreme 1.0-bit regime with 0.99+ fidelity.
 
 ---
 
@@ -38,7 +38,7 @@ To achieve zero-latency kernel execution, we replace all division (`//`) and mod
 ---
 
 ## 3. Results and Analysis
-We evaluated **Kudahitam-Quant** on the Qwen-3.5 2B model at various context lengths.
+We evaluated **Kudahitam-Quant** on the **Qwen-3.5 2B** model at various context lengths.
 
 ### 3.1 Reconstruction Fidelity
 | Context | Bit-rate | Strategy | Acc (Fidelity/Score) | Latency (ms) |
