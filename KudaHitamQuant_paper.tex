@@ -31,12 +31,12 @@ q_{residue} = \text{sign}(H \cdot (r \odot d))
 where $H$ is the Hadamard matrix and $d$ is a random sign flip vector.
 
 \subsection{Bitwise Hardware Optimization}
-We implement the FWHT stages in Triton using bitwise operators for indexing. For a given butterfly stage at step $2^k$:
+We implement the FWHT stages in Triton using bitwise operators for indexing, eliminating standard integer arithmetic:
 \begin{itemize}
-    \item \textbf{Index Masking}: \texttt{id \& (step - 1)}
-    \item \textbf{Coordinate Shifting}: \texttt{id >> k}
+    \item \textbf{Butterfly Selection}: \texttt{(col\_idx \& step) == 0} is used as a mask to select left-side butterfly pairs.
+    \item \textbf{Offset Calculation}: Bitwise shifts (\texttt{<< 10}) are used for thread-to-offset mapping.
 \end{itemize}
-This ensures coordinate mapping executes in a single CUDA cycle.
+This ensures coordinate mapping executes in a single CUDA cycle on T4 hardware.
 
 \section{Experimental Analysis}
 \begin{table}[h]

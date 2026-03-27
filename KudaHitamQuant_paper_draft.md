@@ -26,10 +26,10 @@ where $H$ is the Hadamard matrix and $d \in \{-1, 1\}^D$ is a random sign flip v
 Dense Gaussian projections require $D^2$ operations, which becomes a bottleneck as head dimensions scale ($D \ge 1024$). FWHT decomposes the projection into $\log_2 D$ butterfly stages, requiring only $D \log D$ additions/subtractions. This ensures KudaHitamQuant scales near-linearly with model size.
 
 ### 2.3 Bitwise Hardware Optimization
-To achieve zero-latency kernel execution, we replace all integer arithmetic in the Triton indexing logic with bitwise operators. For a given butterfly stage at step $2^k$:
-- **Index Masking**: `id & (step - 1)` replaces `id % step`.
-- **Coordinate Shifting**: `id >> k` replaces `id // step`.
-This ensures coordinate mapping executes in a single CUDA cycle, maximizing throughput for the recursive transform passes.
+To achieve zero-latency coordinate mapping, we implement FWHT stages in Triton using bitwise shifts and masks that eliminate standard integer arithmetic:
+- **Butterfly Selection**: `(col_idx & step) == 0` is used as a mask to select left-side butterfly pairs, replacing the expensive `(id / step) % 2 == 0` logic.
+- **Offset Calculation**: Bitwise shifts (`<< 10`) are used for thread-to-offset mapping, ensuring thread indexing logic executes in a single CUDA cycle.
+This ensures maximal throughput on T4 hardware for recursive transform passes.
 
 ## 3. Experimental Analysis
 
