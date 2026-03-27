@@ -10,7 +10,7 @@ This document provides a formal comparison between traditional **Gaussian QJL** 
 | **Storage (per layer)** | $256 \times 256 \times \text{fp}32 = 256 \text{ KB}$ | **$256 \times 1 \text{ bit} = 32 \text{ bytes (Sign Vector)}$** |
 
 ## 2. Performance Analysis (Qwen-3.5 2B / 40,000 Tokens)
-Based on benchmarks with **Qwen-3.5 2B** (MLA architecture) on NVIDIA H100:
+Based on benchmarks with **Qwen-3.5 2B** (MLA architecture) on NVIDIA T4:
 
 | Strategy | Latency (ms/layer) | Cosine Similarity (Fidelity) | Accuracy Status |
 | :--- | :---: | :---: | :---: |

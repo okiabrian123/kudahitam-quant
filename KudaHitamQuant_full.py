@@ -107,7 +107,7 @@ def fwht_pytorch(x: torch.Tensor):
 
 # --- COMPRESSORS ---
 
-class KudahitamCompressorV2:
+class KudaHitamQuantCompressorV2:
     def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu",
                  outlier_threshold: Optional[float] = None,
                  protected_dim_count: int = 0):
@@ -151,7 +151,7 @@ class KudahitamCompressorV2:
             idx = compressed["p_idx"]; B_idx, Sk_idx = compressed["shape"][0], compressed["shape"][-2]; q_p = queries[..., idx].float(); k_p = compressed["p_vals"].to(dev).float().reshape(B_idx, -1, Sk_idx, len(idx)).squeeze(1); term3 = torch.matmul(q_p, k_p.transpose(-2, -1)); out += term3
         return out
 
-class KudahitamCompressorGaussian:
+class KudaHitamQuantCompressorGaussian:
     def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu", 
                  outlier_threshold: Optional[float] = None,
                  protected_dim_count: int = 0):
@@ -220,7 +220,7 @@ def main():
 
     print(f"Warming up GPU kernels ({model.device})..."); d_k = torch.randn(1, 1, 128, head_dim).to(model.device); d_q = torch.randn(1, 1, 1, head_dim).to(model.device)
     for _ in range(5):
-        for CC in [KudahitamCompressorV2, KudahitamCompressorGaussian]:
+        for CC in [KudaHitamQuantCompressorV2, KudaHitamQuantCompressorGaussian]:
             comp = CC(head_dim, 1, seed=0, device=model.device); c = comp.compress(d_k, offload=False); _ = comp.asymmetric_attention_scores(d_q, c)
     
     print("-" * 150); print(f"{'Context':8s} | {'Bits':10s} | {'Acc (F)':10s} | {'Acc (G)':10s} | {'Comp(F) ms':12s} | {'Comp(G) ms':12s}")
@@ -237,7 +237,7 @@ def main():
         for b in [1, 2]:
             res_row = {}
             for ver in ["V2", "Gaussian"]:
-                CompClass = KudahitamCompressorV2 if ver == "V2" else KudahitamCompressorGaussian; cos_l, comp_l = [], []
+                CompClass = KudaHitamQuantCompressorV2 if ver == "V2" else KudaHitamQuantCompressorGaussian; cos_l, comp_l = [], []
                 for l_idx, keys in enumerate(gpu_c):
                     if keys is None: continue
                     if isinstance(keys, (tuple, list)): keys = keys[0]

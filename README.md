@@ -13,7 +13,7 @@ This repository implements **Fast Walsh-Hadamard Transform (FWHT) Structured Pro
 
 ## Detailed Benchmark Results (Qwen-3.5 2B MLA)
 
-The following evaluations were performed on an NVIDIA H100 GPU using the **Qwen-3.5 2B** model ($D=256$, H=16, 40k Context).
+The following evaluations were performed on an NVIDIA T4 and CPU offloading using the **Qwen-3.5 2B** model ($D=256$, H=16, 40k Context).
 
 | Strategy | Bit-rate | Acc (Fidelity) | Latency (ms/layer) |
 | :--- | :---: | :---: | :---: |

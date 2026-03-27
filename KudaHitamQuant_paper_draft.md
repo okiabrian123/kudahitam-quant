@@ -33,7 +33,7 @@ This ensures coordinate mapping executes in a single CUDA cycle, maximizing thro
 
 ## 3. Experimental Analysis
 
-### 3.1 Competitive Benchmarking: TurboQuant vs Kudahitam
+### 3.1 Competitive Benchmarking: TurboQuant vs KudaHitamQuant
 We benchmark against the official industry standard for 1-bit KV quantization: Google's TurboQuant.
 
 | Metric | Google TurboQuant | **KudaHitamQuant (Ours)** |
@@ -44,7 +44,7 @@ We benchmark against the official industry standard for 1-bit KV quantization: G
 | **Indexing Logic** | Standard Division | **Bitwise (Shift/Mask)** |
 
 ### 3.2 Performance on Qwen-3.5 2B (40k Context)
-Measured on NVIDIA H100 with $D=256$.
+Measured on NVIDIA T4 with $D=256$.
 
 | Bit-rate | Strategy | Acc (Fidelity) | Latency (ms/layer) |
 | :--- | :--- | :---: | :---: |
@@ -55,7 +55,7 @@ Measured on NVIDIA H100 with $D=256$.
 | 1.0-bit | Gaussian Baseline | 0.9736 | 0.80 |
 
 ## 4. Discussion: Memory-Efficient Training
-Beyond inference, the extreme sample-efficiency of FWHT projections enables **Kudahitam-Training**. By using a **Straight-Through Estimator (STE)**, researchers can conduct KV-activation compression during the forward pass, reducing activation memory by 8-16x. This allows training massive context sequences on existing hardware without the quadratic memory trap of latent activations.
+Beyond inference, the extreme sample-efficiency of FWHT projections enables **KudaHitamQuant-Training**. By using a **Straight-Through Estimator (STE)**, researchers can conduct KV-activation compression during the forward pass, reducing activation memory by 8-16x. This allows training massive context sequences on existing hardware without the quadratic memory trap of latent activations.
 
 ## 5. Conclusion
 **KudaHitamQuant** establishes a new efficiency frontier for KV cache compression. By combining structural innovations in orthogonal projections with low-level bitwise fusions, we achieve quality neutrality at significantly lower bit-rates than previous works, paving the way for ubiquitous endless-context LLM applications.
