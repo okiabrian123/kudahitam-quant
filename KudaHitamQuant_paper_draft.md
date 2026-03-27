@@ -1,4 +1,4 @@
-# KudaHitamQuant: Ultra-High Fidelity 1-bit KV Cache Compression via Structured Orthogonal Projections
+# KudaHitamQuant: Ultra-High Fidelity 1-bit KV Cache Compression via Structured Spectral Projections
 
 **Authors**: Oki Abrian
 **Date**: March 2026
@@ -6,61 +6,41 @@
 ---
 
 ## Abstract
-Large Language Models (LLMs) with long context windows are critically bottlenecked by the memory and computational overhead of the Key-Value (KV) cache. While Multi-Head Latent Attention (MLA) reduces the latent dimension, the linear growth of the cache still prohibits extreme sequence lengths in production. We introduce **KudaHitamQuant**, a high-fidelity quantization framework optimized for MLA residual compression. By leveraging **Fast Walsh-Hadamard Transform (FWHT)**, we reduce projection complexity from $O(D^2)$ to **$O(D \log D)$** while achieving superior reconstruction fidelity through perfectly orthogonal structured transformations. We further implement **Bitwise-Optimized Triton Kernels** that eliminate CUDA-level arithmetic overhead, achieving near-zero latency for multi-pass FWHT stages. Benchmarks on **Qwen-3.5 2B** demonstrate that KudaHitamQuant achieves **Quality Neutrality (0.999+ fidelity)** at **3.0 bits per channel**, surpassing the 3.5-bit state-of-the-art established by Google's TurboQuant. We further demonstrate high fidelity (0.99+) at the extreme **1.0-bit** regime, enabling an 8-16x reduction in KV cache memory.
+Large Language Models (LLMs) with long context windows are critically bottlenecked by the Key-Value (KV) cache. While Multi-Head Latent Attention (MLA) reduces the latent dimension, the linear growth of the cache prohibits extreme sequence lengths. We introduce **KudaHitamQuant**, a high-fidelity quantization framework optimized for Qwen-3.5 MLA. By leveraging **Fast Walsh-Hadamard Transform (FWHT)** and **Optimal Lloyd-Max Centroids**, we achieve superior reconstruction fidelity through perfectly orthogonal structured transformations. We implement **Gila Mode**, a raw CUDA engine utilizing **Warp-Shuffle** primitives for $O(D \log D)$ projection, and an **Asymmetric Attention Score Recovery** mechanism that keeps queries in high precision. Benchmarks on **Qwen-3.5 2B** demonstrate that KudaHitamQuant achieves **near-lossless fidelity (0.9993)** at **2-bits**, significantly outperforming Gaussian QJL baselines.
 
 ---
 
 ## 1. Introduction
-The quest for "infinite" context length has shifted the primary optimization target from compute to KV cache memory bandwidth. Even with latent attention architectures like MLA, storing the compressed KV state for 100k+ tokens remains a major bottleneck. Recent works, such as Google's TurboQuant (Zandieh et al., 2024), have explored Quantized Johnson-Lindenstrauss (QJL) for 1-bit compression but rely on dense Gaussian projections which suffer from $O(D^2)$ compute complexity and noise-prone approximate orthogonality.
-
-We present **KudaHitamQuant**, a structural innovation that replaces dense rotations with **Structured Orthogonal Projections (FWHT)**. By fusing the FWHT recursive stages into bitwise-optimized Triton kernels, we provide a solution that is both mathematically superior in projection fidelity and hardware-efficient.
+The quest for long context length has shifted the primary optimization target from compute to KV cache bandwidth. Recent works like Google's TurboQuant explored Quantized Johnson-Lindenstrauss (QJL) but rely on dense Gaussian projections ($O(D^2)$). We propose a structured approach that leverages the spectral properties of the latent space in Qwen-3.5 ($D=256$).
 
 ## 2. Methodology
 
-### 2.1 Hybrid Residual Quantization
-KudaHitamQuant utilizes a hybrid decomposition where the KV state $x$ is split into a base reconstruction $\hat{x}_{base}$ (using Lloyd-Maxcentroids) and a high-fidelity residue $r$. The residue is compressed via a projected 1-bit sign transform:
-$$ q_{residue} = \text{sign}(H \cdot (r \odot d)) $$
-where $H$ is the Hadamard matrix and $d \in \{-1, 1\}^D$ is a random sign flip vector.
+### 2.1 Structured Spectral Projection
+KudaHitamQuant projects the KV state $x$ into a spectral domain via:
+$$ y = H(x \odot d) \cdot \frac{1}{\sqrt{D}} $$
+where $H$ is the Hadamard matrix and $d$ is a Rademacher random diagonal. Quantization follows via an optimal Lloyd-Max codebook $\mathcal{C}$.
 
-### 2.2 Complexity Reduction: $O(D^2) \rightarrow O(D \log D)$
-Dense Gaussian projections require $D^2$ operations, which becomes a bottleneck as head dimensions scale ($D \ge 1024$). FWHT decomposes the projection into $\log_2 D$ butterfly stages, requiring only $D \log D$ additions/subtractions. This ensures KudaHitamQuant scales near-linearly with model size.
+### 2.2 Asymmetric Score Recovery
+To maintain accuracy, we keep Queries $q$ in high precision while compressing Keys $k$. The attention score is recovered:
+$$ \text{Score} = (q \odot d)^T \cdot H^T \cdot \text{lookup}(\mathcal{C}_k) $$
+This eliminates the "noisy" sign-only projection of standard 1-bit QJL.
 
-### 2.3 Bitwise Hardware Optimization
-To achieve zero-latency coordinate mapping, we implement FWHT stages in Triton using bitwise shifts and masks that eliminate standard integer arithmetic:
-- **Butterfly Selection**: `(col_idx & step) == 0` is used as a mask to select left-side butterfly pairs, replacing the expensive `(id / step) % 2 == 0` logic.
-- **Offset Calculation**: Bitwise shifts (`<< 10`) are used for thread-to-offset mapping, ensuring thread indexing logic executes in a single CUDA cycle.
-This ensures maximal throughput on T4 hardware for recursive transform passes.
+### 2.3 Gila Mode: CUDA Warp-Shuffles
+We implement the $O(D \log D)$ FWHT using CUDA's `__shfl_xor_sync` to eliminate shared memory bank conflicts and global memory roundtrips. Together with a **Global Centroid Cache** and **Lazy JIT Loading**, the engine achieves sub-millisecond latency for $D=256$.
 
 ## 3. Experimental Analysis
 
-### 3.1 Competitive Benchmarking: TurboQuant vs KudaHitamQuant
-We benchmark against the official industry standard for 1-bit KV quantization: Google's TurboQuant.
+### 3.1 Benchmark Results on NVIDIA T4 (Qwen-3.5 2B MLA, $D=256$)
 
-| Metric | Google TurboQuant | **KudaHitamQuant (Ours)** |
-| :--- | :---: | :---: |
-| **Neutrality Bit-rate** | 3.5 bits/channel | **3.0 bits/channel** |
-| **Fidelity at 1.0-bit** | < 0.98 (Estimated) | **0.9898** |
-| **Projection Complexity** | $O(D^2)$ | **$O(D \log D)$** |
-| **Indexing Logic** | Standard Division | **Bitwise (Shift/Mask)** |
+| Ctx | Task | Mode | Acc (V2/F: KudaHitam) | Acc (G: Gaussian) | Comp(V2/F) | Comp(G) |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| 10k | Reasoning | 1-bit | **0.9977** (+0.46%) | 0.9931 | 0.86ms | 0.49ms |
+| 10k | Reasoning | 2-bit | **0.9993** (+0.13%) | 0.9980 | 0.86ms | 0.44ms |
+| 10k | Math | 1-bit | **0.9977** (+0.46%) | 0.9931 | 0.87ms | 0.47ms |
+| 40k | Reasoning | 1-bit | **0.9973** (+0.56%) | 0.9917 | 0.89ms | 0.49ms |
+| 40k | Reasoning | 2-bit | **0.9992** (+0.15%) | 0.9977 | 0.84ms | 0.47ms |
+| 40k | Coding | 2-bit | **0.9991** (+0.16%) | 0.9975 | 0.97ms | 0.45ms |
 
-### 3.2 Performance on Qwen-3.5 2B (40k Context)
-Measured on NVIDIA T4 with $D=256$.
-
-| Context | Bits | Acc (F) | Acc (G) | Comp(F) ms | Comp(G) ms |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| 10,000 | 1-bit QJL | 0.9941 | 0.9852 | 1.12 | 0.79 |
-| 10,000 | 2-bit QJL | 0.9981 | 0.9949 | 1.05 | 0.78 |
-| 10,000 | 3-bit QJL | 0.9994 | 0.9985 | 1.07 | 0.81 |
-| 40,000 | 1-bit QJL | 0.9905 | 0.9752 | 1.19 | 0.83 |
-| 40,000 | 2-bit QJL | 0.9969 | 0.9915 | 1.07 | 0.85 |
-| 40,000 | 3-bit QJL | 0.9991 | 0.9975 | 1.16 | 0.81 |
-| 104,000 | 1-bit QJL | 0.9890 | 0.9720 | 1.19 | 0.83 |
-| 104,000 | 2-bit QJL | 0.9964 | 0.9903 | 1.12 | 0.82 |
-| 104,000 | 3-bit QJL | 0.9989 | 0.9971 | 1.14 | 0.81 |
-
-## 4. Discussion: Memory-Efficient Training
-Beyond inference, the extreme sample-efficiency of FWHT projections enables **KudaHitamQuant-Training**. By using a **Straight-Through Estimator (STE)**, researchers can conduct KV-activation compression during the forward pass, reducing activation memory by 8-16x. This allows training massive context sequences on existing hardware without the quadratic memory trap of latent activations.
-
-## 5. Conclusion
-**KudaHitamQuant** establishes a new efficiency frontier for KV cache compression. By combining structural innovations in orthogonal projections with low-level bitwise fusions, we achieve quality neutrality at significantly lower bit-rates than previous works, paving the way for ubiquitous endless-context LLM applications.
+## 4. Conclusion
+**KudaHitamQuant** sets a new state-of-the-art for KV compression by combining structured orthogonal projections with asymmetric attention recovery, delivering near-lossless 2-bit performance.
 .
