@@ -1,6 +1,6 @@
 # KudaHitamQuant: Ultra-High Fidelity 1-bit KV Cache Compression via Structured Orthogonal Projections
 
-**Authors**: Abrian, KudaHitamQuant Research Team
+**Authors**: Oki Abrian
 **Date**: March 2026
 
 ---
