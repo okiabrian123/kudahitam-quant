@@ -14,7 +14,6 @@ Based on benchmarks with **Qwen-3.5 2B** (MLA architecture) on NVIDIA H100:
 
 | Strategy | Latency (ms/layer) | Cosine Similarity (Fidelity) | Accuracy Status |
 | :--- | :---: | :---: | :---: |
-| **FP16 (Baseline)** | 15.52 ms | 1.0000 | Baseline |
 | **Gaussian 1-bit** | **0.80 ms** | 0.9736 | Noisy |
 | **Kudahitam 1-bit** | **1.16 ms** | **0.9898** | **High Fidelity** |
 | **Kudahitam 3-bit** | **1.10 ms** | **0.9991** | **Quality Neutral** |

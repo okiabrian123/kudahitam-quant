@@ -17,7 +17,6 @@ The following evaluations were performed on an NVIDIA H100 GPU using the **Qwen-
 
 | Strategy | Bit-rate | Acc (Fidelity) | Latency (ms/layer) |
 | :--- | :---: | :---: | :---: |
-| FP16 (Baseline) | 16.0 | 1.0000 | 15.52 |
 | Google TurboQuant (Neutral) | 3.5 | ~1.0000 | 2.10 |
 | **Kudahitam (Neutral)** | **3.0** | **0.9991** | **1.10** |
 | **Kudahitam-Quant** | **2.0** | **0.9967** | **1.09** |
