@@ -288,7 +288,7 @@ __global__ void ultra_fused_hbba_fusion_kernel(
     float* __restrict__ out_norms, 
     float* __restrict__ out_kmse,
     float* __restrict__ out_r_norms,
-    int8_t* __restrict__ out_signs,
+    half* __restrict__ out_signs,
     int D, int N) 
 {
     int global_thread_id = blockIdx.x * blockDim.x + threadIdx.x;
