@@ -507,7 +507,7 @@ __global__ void hbba_calibrate_cuda_kernel(
     if (d >= D) return;
     int n_c = n_map[d];
 
-    __shared__ float s_data[1024];
+    __shared__ float s_data[4096];
     __shared__ float s_centroids[16];
     __shared__ float s_sums[16];
     __shared__ int s_counts[16];
