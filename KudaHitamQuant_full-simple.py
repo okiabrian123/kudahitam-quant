@@ -222,16 +222,9 @@ class KudahitamCompressorV2:
         # Priority: Ultra-Gila Mode (Ultra-Fused: Norm + Scale + FWHT + Quant)
         cuda_ext = load_cuda_ext()
         if CUDA_EXT_AVAILABLE and cuda_ext and flat.is_cuda:
-            # Priority: Ultra-Gila Mode (Monolithic V7.6 Native FP16)
-            indices, vec_norms, k_mse = cuda_ext.ultra_fused_full_fusion(flat.contiguous(), self.d.float().contiguous(), self.centroids.to(dev).float().contiguous())
-        else:
-            vec_norms = torch.norm(flat, dim=-1, keepdim=True)
-            rotated = fwht((flat.float() / (vec_norms + 1e-8)) * self.d)
-            indices = (rotated.unsqueeze(-1) - self.centroids.to(dev)).abs().argmin(-1).to(torch.uint8)
-            k_mse = fwht(self.centroids.to(dev)[indices.long()]) * self.d * vec_norms
-            
-        residual = flat - k_mse; r_norm = torch.norm(residual, dim=-1); projected = fwht(residual * self.d); signs = (projected >= 0).to(torch.int8) * 2 - 1
-        return { "indices": indices, "norms": vec_norms.squeeze(-1).float(), "rank": len(shape), "shape": tuple(shape), "r_norm": r_norm.float().reshape(shape[:-1]), "k_mse": k_mse.reshape(shape), "signs": signs.reshape(shape) }
+            indices, vec_norms, k_mse, signs, r_norms = cuda_ext.ultra_fused_full_fusion(flat.contiguous(), self.d.float().contiguous(), self.centroids.to(dev).float().contiguous())
+            r_norm = r_norms.squeeze(-1)
+            return { "indices": indices, "norms": vec_norms.squeeze(-1).float(), "rank": len(shape), "shape": tuple(shape), "r_norm": r_norm.float().reshape(shape[:-1]), "k_mse": k_mse.reshape(shape), "signs": signs.reshape(shape) }
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:

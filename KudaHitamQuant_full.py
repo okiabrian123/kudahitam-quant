@@ -351,9 +351,10 @@ class KudahitamCompressorV2:
                 indices = (rotated.unsqueeze(-1) - centroids).abs().argmin(-1).to(torch.uint8)
                 k_mse = fwht(centroids[indices.long()]) * self.d * vec_norms
             
-        if self.use_vwh: k_mse = k_mse / self.vwh_weights
-        residual = flat_q - k_mse; r_norm = torch.norm(residual, dim=-1); projected = fwht(residual * self.d); signs = (projected >= 0).to(torch.int8) * 2 - 1
-        return { "indices": indices, "norms": vec_norms.squeeze(-1).float(), "p_indices": p_indices, "p_norms": p_norms.squeeze(-1).float() if p_norms is not None else None, "p_idx": self.protected_indices, "rank": len(shape), "shape": tuple(shape), "r_norm": r_norm.float().reshape(shape[:-1]), "k_mse": k_mse.reshape(shape), "signs": signs.reshape(shape), "is_domain": self.is_domain_layer }
+        if CUDA_EXT_AVAILABLE and cuda_ext and flat.is_cuda and not self.use_fractional and not self.use_dynamic_codebook:
+            indices, vec_norms, k_mse, signs, r_norms = cuda_ext.ultra_fused_full_fusion(flat.contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
+            r_norm = r_norms.squeeze(-1)
+            return { "indices": indices, "norms": vec_norms.squeeze(-1).float(), "p_indices": p_indices, "p_norms": p_norms.squeeze(-1).float() if p_norms is not None else None, "p_idx": self.protected_indices, "rank": len(shape), "shape": tuple(shape), "r_norm": r_norm.float().reshape(shape[:-1]), "k_mse": k_mse.reshape(shape), "signs": signs.reshape(shape), "is_domain": self.is_domain_layer }
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:

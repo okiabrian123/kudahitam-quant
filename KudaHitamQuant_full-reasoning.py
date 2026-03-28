@@ -354,7 +354,8 @@ class KudahitamCompressorV2:
         # Priority: Ultra-Gila Mode (Ultra-Fused: Monolithic V7.5)
         cuda_ext = load_cuda_ext()
         if CUDA_EXT_AVAILABLE and cuda_ext and flat.is_cuda and not self.use_fractional and not self.use_dynamic_codebook:
-            indices, vec_norms, k_mse = cuda_ext.ultra_fused_full_fusion(flat.contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
+            indices, vec_norms, k_mse, signs, r_norms = cuda_ext.ultra_fused_full_fusion(flat.contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
+            return {"indices": indices, "norms": vec_norms, "k_mse": k_mse, "signs": signs, "r_norm": r_norms.squeeze(-1)}
         else:
             # Fallback to standard Gila Mode or Triton/PyTorch
             vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)
