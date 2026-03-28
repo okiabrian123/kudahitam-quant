@@ -291,6 +291,16 @@ __global__ void ultra_fused_hbba_fusion_kernel(
     half* __restrict__ out_signs,
     int D, int N) 
 {
+    // Innovations V8.7: Shared Centroid Cache (LDS)
+    __shared__ float s_centroids[256 * 16]; // 16KB for D=256
+    
+    // Parallel Load Table into SRAM
+    int total_elements = D * 16;
+    for (int i = threadIdx.x; i < total_elements; i += blockDim.x) {
+        if (i < 4096) s_centroids[i] = centroids_table[i];
+    }
+    __syncthreads();
+
     int global_thread_id = blockIdx.x * blockDim.x + threadIdx.x;
     int row_id = (global_thread_id * 8) / D;
     if (row_id >= N) return;
@@ -356,7 +366,7 @@ __global__ void ultra_fused_hbba_fusion_kernel(
     for(int k = 0; k < 8; ++k) {
         int element_idx = lane_in_row * 8 + k;
         int n_centroids = n_centroids_map[element_idx];
-        const float* centroids = centroids_table + element_idx * 16;
+        const float* centroids = s_centroids + element_idx * 16;
         
         float projected = r[k] * f_scale;
         uint8_t best_c = 0; float min_dist = 1e18f;
