@@ -418,7 +418,7 @@ def main():
 
     print(f"Warming up GPU kernels ({model.device})..."); d_k = torch.randn(1, 1, 128, head_dim).to(model.device).half(); d_q = torch.randn(1, 1, 1, head_dim).to(model.device).half()
     for _ in range(5):
-        for CC in [KudahitamCompressorV2, KudahitamCompressorGaussian]:
+        for CC in [KudahitamCompressorBaseline, KudahitamCompressorHBBA]:
             comp = CC(head_dim, 1, seed=0, device=model.device); c = comp.compress(d_k, offload=False); _ = comp.asymmetric_attention_scores(d_q, c)
     
     benchmark_tasks = [
