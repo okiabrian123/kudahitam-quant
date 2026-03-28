@@ -262,13 +262,18 @@ class KudahitamCompressorHBBA:
         self.is_calibrated = True
 
     @torch.no_grad()
+    def calibrate(self, states: torch.Tensor):
+        if self.is_calibrated: return
+        if isinstance(states, (list, tuple)): states = states[0]
+        dev = states.device; flat = states.reshape(-1, states.shape[-1]).float()
+        norm = torch.norm(flat, dim=-1, keepdim=True); rotated = fwht((flat / (norm+1e-8)) * self.d.to(dev)) / math.sqrt(self.head_dim); self._calibrate_hbba(rotated[:1024])
+
+    @torch.no_grad()
     def compress(self, states: torch.Tensor, offload: bool = True) -> dict:
         if isinstance(states, (list, tuple)): states = states[0]
         dev = states.device; shape = states.shape; flat = states.reshape(-1, shape[-1]).half()
         cuda_ext = load_cuda_ext()
-        if not self.is_calibrated:
-            # Quick forward for calibration (Orthonormal Scaling Fix)
-            norm = torch.norm(flat, dim=-1, keepdim=True); rotated = fwht((flat.float() / (norm+1e-8)) * self.d.to(dev)) / math.sqrt(self.head_dim); self._calibrate_hbba(rotated[:1024])
+        if not self.is_calibrated: self.calibrate(states)
         indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.n_centroids_map)
         return { "indices": indices, "norms": vec_norms.squeeze(-1), "k_mse": k_mse.view(shape), "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]), "signs": signs.view(shape), "shape": tuple(shape) }
 
