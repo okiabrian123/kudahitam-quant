@@ -4,8 +4,9 @@
 #include <ATen/cuda/CUDAContext.h>
 
 /**
- * KudaHitam FWHT - Gila Mode V2 (Fused & Vectorized)
+ * KudaHitam FWHT - Gila Mode V3 (Semi-Fused & Vectorized)
  * Optimized for Qwen-3.5 2B (D=256).
+ * Cache invalidated for V3 Build.
  */
 
 __device__ __forceinline__ void fwht_warp(float& val, int mask) {
