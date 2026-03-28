@@ -294,7 +294,7 @@ __global__ void ultra_fused_hbba_fusion_kernel(
     half* __restrict__ out_norms, 
     half* __restrict__ out_kmse,
     half* __restrict__ out_r_norms,
-    half* __restrict__ out_signs,
+    int8_t* __restrict__ out_signs,
     int D, int N) 
 {
     // Innovations V8.7: Shared Centroid Cache (LDS)
@@ -459,12 +459,13 @@ __global__ void ultra_fused_hbba_fusion_kernel(
         r[j] = a + b; r[j + 4] = a - b;
     }
 
-    half* out_half_signs = out_signs + row_id * D + lane_in_row * 8;
-    float final_scale = 1.0f / sqrtf((float)D);
+    uint8_t* out_packed_signs = (uint8_t*)out_signs + row_id * (D/8) + lane_in_row;
+    uint8_t pack = 0;
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        out_half_signs[i] = __float2half(r[i] * final_scale);
+        if (r[i] >= 0) pack |= (1 << i);
     }
+    *out_packed_signs = pack;
 }
 
 std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
@@ -475,13 +476,13 @@ std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
     
     auto idx_options = torch::TensorOptions().dtype(torch::kUInt8).device(x.device());
     auto norm_options = torch::TensorOptions().dtype(torch::kFloat16).device(x.device());
-    auto sign_options = torch::TensorOptions().dtype(torch::kFloat16).device(x.device());
+    auto sign_options = torch::TensorOptions().dtype(torch::kInt8).device(x.device());
 
     torch::Tensor out_idx = torch::empty({N, D}, idx_options);
     torch::Tensor out_norms = torch::empty({N, 1}, norm_options);
     torch::Tensor out_kmse = torch::empty({N, D}, norm_options);
     torch::Tensor out_r_norms = torch::empty({N, 1}, norm_options);
-    torch::Tensor out_signs = torch::empty({N, D}, sign_options);
+    torch::Tensor out_signs = torch::empty({N, D / 8}, sign_options);
 
     at::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -497,7 +498,7 @@ std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
         (half*)out_norms.data_ptr<at::Half>(), 
         (half*)out_kmse.data_ptr<at::Half>(),
         (half*)out_r_norms.data_ptr<at::Half>(),
-        (half*)out_signs.data_ptr<at::Half>(),
+        (int8_t*)out_signs.data_ptr<int8_t>(),
         D, N
     );
     return {out_idx, out_norms, out_kmse, out_r_norms, out_signs};

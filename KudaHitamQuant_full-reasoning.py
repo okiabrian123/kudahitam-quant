@@ -506,11 +506,16 @@ class KudahitamCompressorHBBA:
             score = torch.matmul(q_proj, compressed["quantized"].half().transpose(-2, -1))
             return score * compressed["norms"].unsqueeze(-2)
             
-        k_mse = compressed["k_mse"].to(dev); signs = compressed["signs"].to(dev)
+        k_mse = compressed["k_mse"].to(dev); signs_packed = compressed["signs"].to(dev)
+        # Unpack 1-bit signs (V8.8.0 Bit-Stream Engine)
+        signs = (((signs_packed.unsqueeze(-1) >> torch.arange(8, device=dev)) & 1).float() * 2 - 1)
+        signs = signs.view(queries.shape[:-2] + (-1, self.head_dim)) # (B, H, S, D)
+        
         term1 = torch.matmul(queries.half(), k_mse.transpose(-2, -1))
         q_proj = fwht(queries.half() * self.d.to(dev).half()); qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1))
-        # Total recovery: term1 (base) + qjl_ip (orthonormal residual)
-        return term1 + qjl_ip
+        
+        scale = 1.0 / math.sqrt(self.head_dim); r_norm = compressed["r_norm"].to(dev)
+        return term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
 
 
 # =============================================================================
@@ -619,11 +624,13 @@ def main():
                         curr_p_dim = d_p if is_d else 0; curr_o_bits = o_bits
                         
                         if "HBBA" in s_name:
+                            # HBBA Memory Logic (V8.8.0): Indices (1/4-bit avg 1.75 bit) + Signs (1 bit) + Norms + RNorms
+                            # In practice with bit-packing: (D * 1.75 / 8) + (D / 8) + 2 + 2 = 92 bytes
                             comp = KudahitamCompressorHBBA(D, b_count, seed=l_idx, device=model.device, hbba_4bit_ratio=0.25, use_gaussian=(ver == "Gaussian"))
                             comp.calibrate(keys) # Warm-up/Calibrate OUTSIDE timer
                             if ver == "V2": # Add memory only once
-                                b_eff = 1.75
-                                l_base = (b_eff * D / 8) + 2
+                                b_eff = 2.75
+                                l_base = (b_eff * D / 8) + 4
                                 mem_total += l_base * H
                         elif ver == "V2":
                             curr_use_frac = is_f; curr_use_ultra = (is_f and "Ultra" in s_name)
