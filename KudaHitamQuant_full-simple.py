@@ -58,24 +58,43 @@ def load_cuda_ext():
             return False
 
         current_dir = os.getcwd()
-        try: current_dir = os.path.dirname(os.path.abspath(__file__))
-        except NameError: pass
+        try: 
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            print(f"[KudaHitam] Script directory detected: {current_dir}")
+        except NameError: 
+            print(f"[KudaHitam] __file__ not found, using CWD: {current_dir}")
         
         _src = os.path.join(current_dir, "KudaHitamCUDA.cu")
-        if os.path.exists(_src) and find_nvcc():
-            build_dir = os.path.join(current_dir, "cuda_build")
-            os.makedirs(build_dir, exist_ok=True)
-            try:
-                _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir)
-                CUDA_EXT_AVAILABLE = True
-                print("[KudaHitam] Gila Mode Activated: Raw CUDA Warp-Shuffles Enabled.")
-            except:
-                try: 
-                    _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir, is_python_module=True)
-                    CUDA_EXT_AVAILABLE = True
-                except: pass
+        print(f"[KudaHitam] Searching for KudaHitamCUDA.cu at: {_src}")
+        
+        if not os.path.exists(_src):
+            print(f"[KudaHitam] [!] ERROR: KudaHitamCUDA.cu NOT FOUND. Fallback mode will be active.")
+            return None
+            
+        nvcc_path = find_nvcc()
+        if not nvcc_path:
+            print(f"[KudaHitam] [!] ERROR: NVCC (CUDA Compiler) not found in PATH. Check your CUDA installation.")
+            return None
+        else:
+            print(f"[KudaHitam] NVCC detected.")
+
+        build_dir = os.path.join(current_dir, "cuda_build")
+        os.makedirs(build_dir, exist_ok=True)
+        
+        try:
+            print(f"[KudaHitam] Starting JIT Compilation (Mode: Gila Mode V4)...")
+            _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir)
+            CUDA_EXT_AVAILABLE = True
+            print("[KudaHitam] [✓] ULTRA-GILA MODE ACTIVE: Warp-Only Register FWHT (V4) fully loaded.")
+        except Exception as e:
+            print(f"[KudaHitam] [X] JIT Compilation failed! Error detail:\n{str(e)}")
+            print("[KudaHitam] Falling back to Triton/PyTorch engine.")
+            return None
+            
         return _KudaHitamCUDA
-    except: return None
+    except Exception as e: 
+        print(f"[KudaHitam] Unexpected error in load_cuda_ext: {e}")
+        return None
 
 # --- PURE TRITON KERNELS ---
 
@@ -199,10 +218,18 @@ class KudahitamCompressorV2:
         
         # Priority: Ultra-Gila Mode (Ultra-Fused: Norm + Scale + FWHT + Quant)
         cuda_ext = load_cuda_ext()
-        if CUDA_EXT_AVAILABLE and cuda_ext and flat.is_cuda:
+        if CUDA_EXT_AVAILABLE and cuda_ext and states.is_cuda:
+            if not hasattr(self, '_gila_notified'):
+                print(f"[KudaHitam] [✓] Task Compression: Using Warp-Only Register CUDA Kernel (Gila Mode V4).")
+                self._gila_notified = True
             indices, vec_norms = cuda_ext.ultra_fused_compress(flat.contiguous(), self.d.float().contiguous(), self.centroids.to(dev).float().contiguous())
             k_mse = cuda_ext.ultra_fused_reconstruct(indices, vec_norms, self.centroids.to(dev).float().contiguous(), self.d.float().contiguous())
         else:
+            if not hasattr(self, '_gila_notified'):
+                reason = "CUDA extension not available" if not CUDA_EXT_AVAILABLE else "Input not on CUDA device" if not states.is_cuda else "Unknown fallback"
+                print(f"[KudaHitam] [!] Task Compression: Falling back to Triton/PyTorch. (Reason: {reason})")
+                self._gila_notified = True
+            
             # Fallback to standard Gila Mode or Triton/PyTorch
             vec_norms = torch.norm(flat, dim=-1, keepdim=True)
             rotated = fwht((flat.float() / (vec_norms + 1e-8)) * self.d)

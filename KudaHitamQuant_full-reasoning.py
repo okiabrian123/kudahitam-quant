@@ -333,11 +333,16 @@ class KudahitamCompressorV2:
         cuda_ext = load_cuda_ext()
         if CUDA_EXT_AVAILABLE and cuda_ext and flat_q.is_cuda and not self.use_fractional and not self.use_dynamic_codebook:
             if not hasattr(self, '_gila_notified'):
-                print(f"[KudaHitam] [✓] Task Compression: Using Warp-Only Register CUDA Kernel.")
+                print(f"[KudaHitam] [✓] Task Compression: Using Warp-Only Register CUDA Kernel (Gila Mode V4).")
                 self._gila_notified = True
             indices, vec_norms = cuda_ext.ultra_fused_compress(flat_q.contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
             k_mse = cuda_ext.ultra_fused_reconstruct(indices, vec_norms, self.centroids.float().contiguous(), self.d.float().contiguous())
         else:
+            if not hasattr(self, '_gila_notified'):
+                reason = "CUDA extension not available" if not CUDA_EXT_AVAILABLE else "Input not on CUDA device" if not flat_q.is_cuda else "Unsupported mode (Fractional/Dynamic)"
+                print(f"[KudaHitam] [!] Task Compression: Falling back to Triton/PyTorch. (Reason: {reason})")
+                self._gila_notified = True
+            
             # Fallback to standard Gila Mode or Triton/PyTorch
             vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)
             rotated = fwht((flat_q.float() / (vec_norms + 1e-8)) * self.d)
