@@ -191,8 +191,6 @@ class KudahitamCompressorV2:
             self.centroids = torch.tensor(centroids, dtype=torch.float32).to(device)
             _CENTROID_CACHE[cache_key] = self.centroids.cpu()
 
-        self.d_float = self.d.float().contiguous()
-        self.centroids_float = self.centroids.float().contiguous()
 
     @torch.no_grad()
     def compress(self, states: torch.Tensor, offload: bool = True) -> dict:
@@ -202,8 +200,8 @@ class KudahitamCompressorV2:
         # Priority: Ultra-Gila Mode (Ultra-Fused: Norm + Scale + FWHT + Quant)
         cuda_ext = load_cuda_ext()
         if CUDA_EXT_AVAILABLE and cuda_ext and flat.is_cuda:
-            indices, vec_norms = cuda_ext.ultra_fused_compress(flat.contiguous(), self.d_float, self.centroids_float if self.centroids_float.device == dev else self.centroids_float.to(dev))
-            k_mse = fwht(self.centroids.to(dev)[indices.long()]) * self.d * vec_norms
+            indices, vec_norms = cuda_ext.ultra_fused_compress(flat.contiguous(), self.d.float().contiguous(), self.centroids.to(dev).float().contiguous())
+            k_mse = cuda_ext.ultra_fused_reconstruct(indices, vec_norms, self.centroids.to(dev).float().contiguous(), self.d.float().contiguous())
         else:
             # Fallback to standard Gila Mode or Triton/PyTorch
             vec_norms = torch.norm(flat, dim=-1, keepdim=True)

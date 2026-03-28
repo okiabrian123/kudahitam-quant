@@ -256,8 +256,6 @@ class KudahitamCompressorV2:
         _idx = torch.arange(head_dim); _gray = _idx ^ (_idx >> 1); _rev = 0
         for _i in range(int(math.log2(head_dim))): _rev = (_rev << 1) | ((_gray >> _i) & 1)
         self.walsh_indices = _rev.to(device)
-        self.d_float = self.d.float().contiguous()
-        self.centroids_float = self.centroids.float().contiguous()
 
     def _init_mini_qjl(self, p_dim: int, seed: int, device: str, p_bits: int):
         if p_dim <= 0: return
@@ -308,8 +306,8 @@ class KudahitamCompressorV2:
         # Priority: Ultra-Gila Mode (Ultra-Fused: Norm + Scale + FWHT + Quant)
         cuda_ext = load_cuda_ext()
         if CUDA_EXT_AVAILABLE and cuda_ext and flat_q.is_cuda and not self.use_fractional and not self.use_dynamic_codebook:
-            indices, vec_norms = cuda_ext.ultra_fused_compress(flat_q.contiguous(), self.d_float, self.centroids_float if self.centroids_float.device == dev else self.centroids_float.to(dev))
-            k_mse = fwht(self.centroids.to(dev)[indices.long()]) * self.d * vec_norms
+            indices, vec_norms = cuda_ext.ultra_fused_compress(flat_q.contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
+            k_mse = cuda_ext.ultra_fused_reconstruct(indices, vec_norms, self.centroids.float().contiguous(), self.d.float().contiguous())
         else:
             # Fallback to standard Gila Mode or Triton/PyTorch
             vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)

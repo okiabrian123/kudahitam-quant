@@ -4,19 +4,21 @@
 #include <ATen/cuda/CUDAContext.h>
 
 /**
- * KudaHitam FWHT - Gila Mode V3 (Semi-Fused & Vectorized)
- * Optimized for Qwen-3.5 2B (D=256).
- * Cache invalidated for V3 Build.
+ * KudaHitam FWHT - Gila Mode Ultra-Fused
+ * Everything in ONE PASS: Norm -> Scale -> FWHT -> Quant
  */
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    return val;
+}
 
 __device__ __forceinline__ void fwht_warp(float& val, int mask) {
     for (int step = 1; step <= mask; step <<= 1) {
         float other = __shfl_xor_sync(0xffffffff, val, step);
-        if ((threadIdx.x & step) == 0) {
-            val = val + other;
-        } else {
-            val = other - val;
-        }
+        if ((threadIdx.x & step) == 0) val = val + other;
+        else val = other - val;
     }
 }
 
@@ -44,12 +46,12 @@ __global__ void fwht_kernel_legacy(float* __restrict__ x, int D, int N) {
     x[row_idx * D + tid] = val * scale;
 }
 
-__global__ void fused_compress_kernel(
+__global__ void ultra_fused_compress_kernel(
     const float* __restrict__ x, 
-    const float* __restrict__ vec_norms,
-    const float* __restrict__ d,
+    const float* __restrict__ d, 
     const float* __restrict__ centroids, 
-    uint8_t* __restrict__ out, 
+    uint8_t* __restrict__ out_idx, 
+    float* __restrict__ out_norms, 
     int D, int N, int n_centroids) 
 {
     int row_idx = blockIdx.x;
@@ -58,12 +60,32 @@ __global__ void fused_compress_kernel(
     
     __shared__ float sdata[1024]; 
     
-    // Gila Mode V3: Fused Load & Scale
+    // 1. Load, Scale by d, and compute partial sum of squares
     float x_val = x[row_idx * D + tid];
-    float norm_val = vec_norms[row_idx] + 1e-8f;
     float d_val = d[tid];
-    float val = (x_val / norm_val) * d_val;
+    float sq = x_val * x_val;
     
+    // Warp-level reduction for sum of squares
+    float sum_sq = warp_reduce_sum(sq);
+    
+    // Block-level reduction (shared memory)
+    if ((tid & 31) == 0) sdata[tid >> 5] = sum_sq;
+    __syncthreads();
+    
+    if (tid < 32) {
+        sum_sq = (tid < (D >> 5)) ? sdata[tid] : 0.0f;
+        sum_sq = warp_reduce_sum(sum_sq);
+        if (tid == 0) sdata[0] = sqrtf(sum_sq + 1e-8f); // This is the L2 norm
+    }
+    __syncthreads();
+    
+    float norm = sdata[0];
+    if (tid == 0) out_norms[row_idx] = norm;
+    
+    // 2. Prepare for FWHT: (x * d) / norm
+    float val = (x_val * d_val) / norm;
+    
+    // 3. FWHT (Gila Mode)
     fwht_warp(val, 16);
     sdata[tid] = val; __syncthreads();
     
@@ -75,8 +97,8 @@ __global__ void fused_compress_kernel(
         sdata[tid] = val; __syncthreads();
     }
     
-    float scale = 1.0f / sqrtf((float)D);
-    float projected = val * scale;
+    // 4. Orthonormal scaling + Argmin
+    float projected = val * (1.0f / sqrtf((float)D));
     
     float min_dist = 1e18f;
     uint8_t best_idx = 0;
@@ -88,7 +110,9 @@ __global__ void fused_compress_kernel(
             best_idx = (uint8_t)i;
         }
     }
-    out[row_idx * D + tid] = best_idx;
+    
+    // 5. Final Store
+    out_idx[row_idx * D + tid] = best_idx;
 }
 
 void fwht_cuda_forward(torch::Tensor x) {
@@ -101,28 +125,88 @@ void fwht_cuda_forward(torch::Tensor x) {
     fwht_kernel_legacy<<<blocks, threads, 0, stream>>>(x.data_ptr<float>(), D, N);
 }
 
-torch::Tensor fused_compress_cuda(torch::Tensor x, torch::Tensor norms, torch::Tensor d, torch::Tensor centroids) {
+std::vector<torch::Tensor> ultra_fused_compress_cuda(
+    torch::Tensor x, torch::Tensor d, torch::Tensor centroids) 
+{
     const int N = x.size(0);
     const int D = x.size(1);
     const int n_centroids = centroids.size(0);
-    auto options = torch::TensorOptions().dtype(torch::kUInt8).device(x.device());
-    torch::Tensor out = torch::empty({N, D}, options);
+    auto idx_options = torch::TensorOptions().dtype(torch::kUInt8).device(x.device());
+    auto norm_options = torch::TensorOptions().dtype(torch::kFloat32).device(x.device());
+    torch::Tensor out_idx = torch::empty({N, D}, idx_options);
+    torch::Tensor out_norms = torch::empty({N, 1}, norm_options);
     at::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     dim3 blocks(N);
     dim3 threads(D);
-    fused_compress_kernel<<<blocks, threads, 0, stream>>>(
-        x.data_ptr<float>(), 
-        norms.data_ptr<float>(),
-        d.data_ptr<float>(),
-        centroids.data_ptr<float>(), 
-        out.data_ptr<uint8_t>(), 
+    ultra_fused_compress_kernel<<<blocks, threads, 0, stream>>>(
+        x.data_ptr<float>(), d.data_ptr<float>(), centroids.data_ptr<float>(), 
+        out_idx.data_ptr<uint8_t>(), out_norms.data_ptr<float>(), 
         D, N, n_centroids
     );
-    return out;
+    return {out_idx, out_norms};
 }
+
+__global__ void ultra_fused_reconstruct_kernel(
+    const uint8_t* __restrict__ indices,
+    const float* __restrict__ vec_norms,
+    const float* __restrict__ centroids,
+    const float* __restrict__ d,
+    float* __restrict__ out_kmse,
+    int D, int N)
+{
+    int row_idx = blockIdx.x;
+    if (row_idx >= N) return;
+    int tid = threadIdx.x;
+    
+    __shared__ float sdata[1024];
+    
+    // 1. Dequantize
+    uint8_t idx = indices[row_idx * D + tid];
+    float val = centroids[idx];
+    
+    // 2. FWHT
+    fwht_warp(val, 16);
+    sdata[tid] = val; __syncthreads();
+    
+    for (int step = 32; step < D; step <<= 1) {
+        float other = sdata[tid ^ step];
+        if ((tid & step) == 0) val = val + other;
+        else val = other - val;
+        __syncthreads();
+        sdata[tid] = val; __syncthreads();
+    }
+    
+    // 3. Orthonormal scaling, un-rademacher (d), and multiply by norm
+    float scale = 1.0f / sqrtf((float)D);
+    float d_val = d[tid];
+    float norm = vec_norms[row_idx];
+    
+    out_kmse[row_idx * D + tid] = val * scale * d_val * norm;
+}
+
+torch::Tensor ultra_fused_reconstruct_cuda(
+    torch::Tensor indices, torch::Tensor vec_norms, torch::Tensor centroids, torch::Tensor d) 
+{
+    const int N = indices.size(0);
+    const int D = indices.size(1);
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(indices.device());
+    torch::Tensor out_kmse = torch::empty({N, D}, options);
+    at::cuda::CUDAGuard device_guard(indices.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    dim3 blocks(N);
+    dim3 threads(D);
+    ultra_fused_reconstruct_kernel<<<blocks, threads, 0, stream>>>(
+        indices.data_ptr<uint8_t>(), vec_norms.data_ptr<float>(), 
+        centroids.data_ptr<float>(), d.data_ptr<float>(), 
+        out_kmse.data_ptr<float>(), D, N
+    );
+    return out_kmse;
+}
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &fwht_cuda_forward, "KudaHitam FWHT Forward (Legacy)");
-    m.def("fused_compress", &fused_compress_cuda, "KudaHitam Fused FWHT + Quantization");
+    m.def("ultra_fused_compress", &ultra_fused_compress_cuda, "KudaHitam Ultra-Fused Compression");
+    m.def("ultra_fused_reconstruct", &ultra_fused_reconstruct_cuda, "KudaHitam Ultra-Fused Reconstruction");
 }
