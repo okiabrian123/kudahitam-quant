@@ -272,10 +272,23 @@ class KudahitamCompressorHBBA:
     def compress(self, states: torch.Tensor, offload: bool = True) -> dict:
         if isinstance(states, (list, tuple)): states = states[0]
         dev = states.device; shape = states.shape; flat = states.reshape(-1, shape[-1]).half()
-        cuda_ext = load_cuda_ext()
         if not self.is_calibrated: self.calibrate(states)
+        
+        if self.use_gaussian:
+            norm = torch.norm(flat, dim=-1, keepdim=True)
+            rotated = (flat.float() / (norm+1e-8)) @ self.P.float().T
+            indices = (rotated.unsqueeze(-1) - self.centroids_table).abs().argmin(-1).to(torch.uint8)
+            quantized = self.centroids_table[torch.arange(self.head_dim, device=dev), indices.long()]
+            return { 
+                "indices": indices.view(shape), 
+                "norms": norm.view(shape[:-1]), 
+                "quantized": quantized.view(shape), 
+                "shape": tuple(shape), "use_gaussian": True 
+            }
+
+        cuda_ext = load_cuda_ext()
         indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.n_centroids_map)
-        return { "indices": indices, "norms": vec_norms.squeeze(-1), "k_mse": k_mse.view(shape), "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]), "signs": signs.view(shape), "shape": tuple(shape) }
+        return { "indices": indices, "norms": vec_norms.squeeze(-1), "k_mse": k_mse.view(shape), "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]), "signs": signs.view(shape), "shape": tuple(shape), "use_gaussian": False }
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:

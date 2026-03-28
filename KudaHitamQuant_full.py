@@ -473,8 +473,13 @@ class KudahitamCompressorHBBA:
             rotated = (flat.float() / (norm+1e-8)) @ self.P.float().T
             indices = (rotated.unsqueeze(-1) - self.centroids_table).abs().argmin(-1).to(torch.uint8)
             quantized = self.centroids_table[torch.arange(self.head_dim, device=dev), indices.long()]
-            return { "indices": indices, "norms": norm, "quantized": quantized, "shape": tuple(shape), "use_gaussian": True }
-
+            return { 
+                "indices": indices.view(shape), 
+                "norms": norm.view(shape[:-1]), 
+                "quantized": quantized.view(shape), 
+                "shape": tuple(shape), "use_gaussian": True 
+            }
+        
         cuda_ext = load_cuda_ext()
         indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.n_centroids_map)
         return {
