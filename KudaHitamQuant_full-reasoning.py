@@ -498,6 +498,7 @@ MODEL_NAME = "Qwen/Qwen3.5-2B"
 
 def main():
     print("=" * 150); print(f"      KUDAHITAM-QUANT: PURE TRITON MULTI-PASS BENCHMARK (STABLE)"); print("=" * 150)
+    if not hasattr(main, 'all_results'): main.all_results = []
     
     print("Pre-compiling KudaHitam CUDA JIT Extension...")
     load_cuda_ext()
