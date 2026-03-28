@@ -66,16 +66,22 @@ def load_cuda_ext():
             build_dir = os.path.join(current_dir, "cuda_build")
             os.makedirs(build_dir, exist_ok=True)
             try:
-                _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir)
+                _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=True, with_cuda=True, build_directory=build_dir)
                 CUDA_EXT_AVAILABLE = True
-                print("[KudaHitam] Gila Mode Activated: Raw CUDA Warp-Shuffles Enabled.")
-            except:
+                print("[KudaHitam] Gila Mode V3 Activated: Raw CUDA Warp-Shuffles Enabled.")
+            except Exception as e:
                 try: 
-                    _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir, is_python_module=True)
+                    _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=True, with_cuda=True, build_directory=build_dir, is_python_module=True)
                     CUDA_EXT_AVAILABLE = True
-                except: pass
+                    print("[KudaHitam] Gila Mode V3 Activated: Raw CUDA Warp-Shuffles Enabled.")
+                except Exception as e2:
+                    print(f"[KudaHitam] CUDA Compile Failed! Falling back to Triton. Errors:\n1. {e}\n2. {e2}")
+        else:
+            print(f"[KudaHitam] CUDA source not found or NVCC missing. src exist: {os.path.exists(_src)}, nvcc found: {find_nvcc()}")
         return _KudaHitamCUDA
-    except: return None
+    except Exception as e_out:
+        print(f"[KudaHitam] Unexpected error during CUDA load: {e_out}")
+        return None
 
 # --- PURE TRITON KERNELS ---
 
