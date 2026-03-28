@@ -507,26 +507,19 @@ __global__ void hbba_calibrate_cuda_kernel(
     if (d >= D) return;
     int n_c = n_map[d];
 
-    __shared__ float s_data[2048];
     __shared__ float s_centroids[16];
     __shared__ float s_sums[16];
     __shared__ int s_counts[16];
 
-    // 1. Parallel Load Sample Data to SRAM
-    for (int i = threadIdx.x; i < N; i += blockDim.x) {
-        s_data[i] = sample[i * D + d];
-    }
-    __syncthreads();
-
-    // 2. Initial Min-Max for Uniform Init
+    // 1. Initial Min-Max for Uniform Init (Streaming from Global)
     float min_val = 1e18f, max_val = -1e18f;
     for (int i = threadIdx.x; i < N; i += blockDim.x) {
-        float val = s_data[i];
+        float val = sample[i * D + d];
         min_val = fminf(min_val, val);
         max_val = fmaxf(max_val, val);
     }
     
-    // Reduction in Shared Memory
+    // Block-wide reduction for min/max
     __shared__ float rs_min[128], rs_max[128];
     rs_min[threadIdx.x] = min_val;
     rs_max[threadIdx.x] = max_val;
@@ -549,13 +542,13 @@ __global__ void hbba_calibrate_cuda_kernel(
     }
     __syncthreads();
 
-    // 3. Lloyd-Max Iterations
+    // 2. Lloyd-Max Iterations (Streaming from Global)
     for (int iter = 0; iter < 10; ++iter) {
         if (threadIdx.x < 16) { s_sums[threadIdx.x] = 0.0f; s_counts[threadIdx.x] = 0; }
         __syncthreads();
 
         for (int i = threadIdx.x; i < N; i += blockDim.x) {
-            float val = s_data[i];
+            float val = sample[i * D + d];
             int best_c = 0; float min_d = 1e18f;
             for (int c = 0; c < n_c; ++c) {
                 float dist = fabsf(val - s_centroids[c]);
@@ -572,7 +565,7 @@ __global__ void hbba_calibrate_cuda_kernel(
         __syncthreads();
     }
 
-    // 4. Write back
+    // 3. Write back
     if (threadIdx.x < n_c) {
         centroids[d * 16 + threadIdx.x] = s_centroids[threadIdx.x];
     }

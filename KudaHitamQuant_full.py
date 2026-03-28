@@ -450,8 +450,8 @@ class KudahitamCompressorHBBA:
         if isinstance(states, (list, tuple)): states = states[0]
         dev = states.device; D = states.shape[-1]
         
-        # 2k Contiguous Sample (as requested)
-        flat = states.reshape(-1, D)[:2000].float()
+        # 10k Contiguous Sample (Ultra Precision)
+        flat = states.reshape(-1, D)[:10000].float()
         norm = torch.norm(flat, dim=-1, keepdim=True)
         rotated = fwht((flat / (norm+1e-8)) * self.d.to(dev)) / math.sqrt(D)
         self._calibrate_hbba(rotated)
