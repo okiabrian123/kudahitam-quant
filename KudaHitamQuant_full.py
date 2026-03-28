@@ -470,17 +470,23 @@ class KudahitamCompressorHBBA:
         
         if self.use_gaussian:
             norm = torch.norm(flat, dim=-1, keepdim=True)
-            rotated = (flat.float() / (norm+1e-8)) @ self.P.float().T
-            indices = (rotated.unsqueeze(-1) - self.centroids_table).abs().argmin(-1).to(torch.uint8)
-            quantized = self.centroids_table[torch.arange(self.head_dim, device=dev), indices.long()]
-            return { "indices": indices, "norms": norm, "quantized": quantized, "shape": tuple(shape), "use_gaussian": True }
-
+            if self.P.device != dev: self.P = self.P.to(dev)
+            vec_norms = torch.norm(flat, dim=-1, keepdim=True)
+            rotated = (flat.float() / (vec_norms.float() + 1e-8)) @ self.P.float().T
+            n_levels = 16 # 4-bit ablation
+            c = torch.linspace(rotated.min(), rotated.max(), n_levels, device=dev)
+            indices = (rotated.unsqueeze(-1) - c).abs().argmin(-1).to(torch.uint8)
+            quantized = c[indices.long()]
+            return { "use_gaussian": True, "quantized": quantized.reshape(shape).half(), "norms": vec_norms.reshape(shape[:-1]).half() }
+            
         cuda_ext = load_cuda_ext()
         indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.n_centroids_map)
-        return {
-            "indices": indices, "norms": vec_norms.squeeze(-1), "k_mse": k_mse.view(shape),
-            "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]), "signs": signs.view(shape),
-            "shape": tuple(shape), "use_gaussian": False
+        return { 
+            "indices": indices, 
+            "norms": vec_norms.reshape(shape[:-1]), 
+            "k_mse": k_mse.view(shape), 
+            "r_norm": r_norm.reshape(shape[:-1]), 
+            "signs": signs.view(shape) 
         }
 
     @torch.no_grad()
