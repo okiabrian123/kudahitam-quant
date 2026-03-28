@@ -240,9 +240,10 @@ class KudahitamCompressorV2:
         scale = 1.0 / math.sqrt(self.head_dim); return term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
 
 class KudahitamCompressorHBBA:
-    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu", hbba_4bit_ratio: float = 0.25):
-        self.head_dim = head_dim; self.seed = seed; self.device = device; self.hbba_4bit_ratio = hbba_4bit_ratio
+    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu", hbba_4bit_ratio: float = 0.25, use_gaussian: bool = False):
+        self.head_dim = head_dim; self.seed = seed; self.device = device; self.hbba_4bit_ratio = hbba_4bit_ratio; self.use_gaussian = use_gaussian
         self.d = (torch.randint(0, 2, (head_dim,), generator=torch.Generator().manual_seed(seed)) * 2 - 1).float().to(device)
+        if use_gaussian: self.P = torch.randn(head_dim, head_dim, device=device).half() / math.sqrt(head_dim)
         self.centroids_table = None; self.n_centroids_map = None; self.is_calibrated = False
 
     def _calibrate_hbba(self, sample_rotated: torch.Tensor):
@@ -251,14 +252,13 @@ class KudahitamCompressorHBBA:
         top_indices = torch.topk(variances, num_4bit).indices
         self.n_centroids_map = torch.full((D,), 2, dtype=torch.int32, device=dev); self.n_centroids_map[top_indices] = 16
         self.centroids_table = torch.zeros((D, 16), device=dev)
-        for i in range(D):
-            n_c = int(self.n_centroids_map[i]); data = sample_rotated[:, i]; c = torch.linspace(data.min(), data.max(), n_c, device=dev)
-            for _ in range(10): 
-                dist = (data.unsqueeze(-1) - c).abs(); idx = dist.argmin(-1)
-                for k in range(n_c):
-                    mask = (idx == k)
-                    if mask.any(): c[k] = data[mask].mean()
-            self.centroids_table[i, :n_c] = c
+        for n_c in [2, 16]:
+            mask = (self.n_centroids_map == n_c)
+            if not mask.any(): continue
+            subset = sample_rotated[:, mask]
+            mi = subset.min(0)[0]; ma = subset.max(0)[0]
+            c = torch.linspace(0, 1, n_c, device=dev).unsqueeze(1) * (ma - mi) + mi
+            self.centroids_table[mask, :n_c] = c.T
         self.is_calibrated = True
 
     @torch.no_grad()
@@ -266,7 +266,7 @@ class KudahitamCompressorHBBA:
         if self.is_calibrated: return
         if isinstance(states, (list, tuple)): states = states[0]
         dev = states.device; flat = states.reshape(-1, states.shape[-1]).float()
-        norm = torch.norm(flat, dim=-1, keepdim=True); rotated = fwht((flat / (norm+1e-8)) * self.d.to(dev)) / math.sqrt(self.head_dim); self._calibrate_hbba(rotated[:1024])
+        norm = torch.norm(flat, dim=-1, keepdim=True); rotated = fwht((flat / (norm+1e-8)) * self.d.to(dev).half()) / math.sqrt(self.head_dim); self._calibrate_hbba(rotated[:1024])
 
     @torch.no_grad()
     def compress(self, states: torch.Tensor, offload: bool = True) -> dict:
@@ -279,8 +279,14 @@ class KudahitamCompressorHBBA:
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:
-        dev = queries.device; k_mse = compressed["k_mse"].to(dev).float(); signs = compressed["signs"].to(dev).float(); r_norm = compressed["r_norm"].to(dev).float()
-        term1 = torch.matmul(queries.float(), k_mse.transpose(-2, -1)); q_proj = fwht(queries.float() * self.d.to(dev)); qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1)); scale = 1.0 / math.sqrt(self.head_dim); return term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
+        dev = queries.device
+        if compressed.get("use_gaussian", False):
+            q_proj = queries.half() @ self.P.half().T
+            score = torch.matmul(q_proj, compressed["quantized"].half().transpose(-2, -1))
+            return score * compressed["norms"].unsqueeze(-2)
+            
+        k_mse = compressed["k_mse"].to(dev); signs = compressed["signs"].to(dev); r_norm = compressed["r_norm"].to(dev)
+        term1 = torch.matmul(queries.half(), k_mse.transpose(-2, -1)); q_proj = fwht(queries.half() * self.d.to(dev).half()); qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1)); scale = 1.0 / math.sqrt(self.head_dim); return term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
 
 # Baseline unchanged (Gaussian)
 class KudahitamCompressorGaussian:

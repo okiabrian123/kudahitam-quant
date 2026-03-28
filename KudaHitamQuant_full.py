@@ -426,33 +426,28 @@ class KudahitamCompressorGaussian:
         return out
 
 class KudahitamCompressorHBBA:
-    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu", hbba_4bit_ratio: float = 0.25):
-        self.head_dim = head_dim; self.seed = seed; self.device = device; self.hbba_4bit_ratio = hbba_4bit_ratio
+    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu", hbba_4bit_ratio: float = 0.25, use_gaussian: bool = False):
+        self.head_dim = head_dim; self.seed = seed; self.device = device; self.hbba_4bit_ratio = hbba_4bit_ratio; self.use_gaussian = use_gaussian
         self.d = (torch.randint(0, 2, (head_dim,), generator=torch.Generator().manual_seed(seed)) * 2 - 1).float().to(device)
+        if use_gaussian: self.P = torch.randn(head_dim, head_dim, device=device).half() / math.sqrt(head_dim)
         self.centroids_table = None; self.n_centroids_map = None; self.is_calibrated = False
 
     def _calibrate_hbba(self, sample_rotated: torch.Tensor):
         dev = sample_rotated.device; D = self.head_dim
-        # 1. Variance-based allocation
         variances = sample_rotated.var(0); num_4bit = int(D * self.hbba_4bit_ratio)
         top_indices = torch.topk(variances, num_4bit).indices
-        
         self.n_centroids_map = torch.full((D,), 2, dtype=torch.int32, device=dev)
         self.n_centroids_map[top_indices] = 16
         
-        # 2. Per-dimension Lloyd-Max
+        # Vectorized initialization: 4-bit vs 1-bit
         self.centroids_table = torch.zeros((D, 16), device=dev)
-        for i in range(D):
-            n_c = int(self.n_centroids_map[i]); data = sample_rotated[:, i]
-            # Simple Lloyd-Max initializer
-            c = torch.linspace(data.min(), data.max(), n_c, device=dev)
-            for _ in range(10): # Quick calibration
-                dist = (data.unsqueeze(-1) - c).abs()
-                idx = dist.argmin(-1)
-                for k in range(n_c):
-                    mask = (idx == k)
-                    if mask.any(): c[k] = data[mask].mean()
-            self.centroids_table[i, :n_c] = c
+        for n_c in [2, 16]:
+            mask = (self.n_centroids_map == n_c)
+            if not mask.any(): continue
+            subset = sample_rotated[:, mask] # [1024, count]
+            mi = subset.min(0)[0]; ma = subset.max(0)[0]
+            c = torch.linspace(0, 1, n_c, device=dev).unsqueeze(1) * (ma - mi) + mi
+            self.centroids_table[mask, :n_c] = c.T
         self.is_calibrated = True
 
     @torch.no_grad()
@@ -461,31 +456,44 @@ class KudahitamCompressorHBBA:
         if isinstance(states, (list, tuple)): states = states[0]
         dev = states.device; flat = states.reshape(-1, states.shape[-1]).float()
         norm = torch.norm(flat, dim=-1, keepdim=True)
-        rotated = fwht((flat / (norm+1e-8)) * self.d.to(dev)) / math.sqrt(self.head_dim)
+        if self.use_gaussian:
+            rotated = (flat / (norm+1e-8)) @ self.P.float().T
+        else:
+            rotated = fwht((flat / (norm+1e-8)) * self.d.to(dev)) / math.sqrt(self.head_dim)
         self._calibrate_hbba(rotated[:1024])
 
     @torch.no_grad()
     def compress(self, states: torch.Tensor, offload: bool = True) -> dict:
         if isinstance(states, (list, tuple)): states = states[0]
         dev = states.device; shape = states.shape; flat = states.reshape(-1, shape[-1]).half()
-        cuda_ext = load_cuda_ext()
         if not self.is_calibrated: self.calibrate(states)
         
-        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(
-            flat.contiguous(), self.d.to(dev).contiguous(), 
-            self.centroids_table, self.n_centroids_map
-        )
+        if self.use_gaussian:
+            norm = torch.norm(flat, dim=-1, keepdim=True)
+            rotated = (flat.float() / (norm+1e-8)) @ self.P.float().T
+            indices = (rotated.unsqueeze(-1) - self.centroids_table).abs().argmin(-1).to(torch.uint8)
+            quantized = self.centroids_table[torch.arange(self.head_dim, device=dev), indices.long()]
+            return { "indices": indices, "norms": norm, "quantized": quantized, "shape": tuple(shape), "use_gaussian": True }
+
+        cuda_ext = load_cuda_ext()
+        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.n_centroids_map)
         return {
             "indices": indices, "norms": vec_norms.squeeze(-1), "k_mse": k_mse.view(shape),
             "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]), "signs": signs.view(shape),
-            "shape": tuple(shape)
+            "shape": tuple(shape), "use_gaussian": False
         }
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:
-        dev = queries.device; k_mse = compressed["k_mse"].to(dev).float(); signs = compressed["signs"].to(dev).float(); r_norm = compressed["r_norm"].to(dev).float()
-        term1 = torch.matmul(queries.float(), k_mse.transpose(-2, -1))
-        q_proj = fwht(queries.float() * self.d.to(dev)); qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1))
+        dev = queries.device
+        if compressed.get("use_gaussian", False):
+            q_proj = queries.half() @ self.P.half().T
+            score = torch.matmul(q_proj, compressed["quantized"].half().transpose(-2, -1))
+            return score * compressed["norms"].unsqueeze(-2)
+            
+        k_mse = compressed["k_mse"].to(dev); signs = compressed["signs"].to(dev); r_norm = compressed["r_norm"].to(dev)
+        term1 = torch.matmul(queries.half(), k_mse.transpose(-2, -1))
+        q_proj = fwht(queries.half() * self.d.to(dev).half()); qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1))
         scale = 1.0 / math.sqrt(self.head_dim); out = term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
         return out
 
@@ -628,7 +636,7 @@ def main():
                         curr_p_dim = d_p if is_d else 0; curr_o_bits = o_bits
                         
                         if "HBBA" in s_name:
-                            comp = KudahitamCompressorHBBA(D, b_count, seed=l_idx, device=model.device, hbba_4bit_ratio=0.25)
+                            comp = KudahitamCompressorHBBA(D, b_count, seed=l_idx, device=model.device, hbba_4bit_ratio=0.25, use_gaussian=(ver == "Gaussian"))
                             comp.calibrate(keys) # Warm-up/Calibrate OUTSIDE timer
                             if ver == "V2": # Add memory only once
                                 b_eff = 1.75

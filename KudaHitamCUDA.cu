@@ -285,9 +285,9 @@ __global__ void ultra_fused_hbba_fusion_kernel(
     const float* __restrict__ centroids_table, // [D, 16]
     const int* __restrict__ n_centroids_map,   // [D]
     uint8_t* __restrict__ out_idx, 
-    float* __restrict__ out_norms, 
-    float* __restrict__ out_kmse,
-    float* __restrict__ out_r_norms,
+    half* __restrict__ out_norms, 
+    half* __restrict__ out_kmse,
+    half* __restrict__ out_r_norms,
     half* __restrict__ out_signs,
     int D, int N) 
 {
@@ -316,7 +316,7 @@ __global__ void ultra_fused_hbba_fusion_kernel(
         sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset, threads_per_row);
     }
     float norm = __shfl_sync(0xffffffff, sum_sq > 0 ? sqrtf(sum_sq) : 1e-8f, 0, threads_per_row);
-    if (lane_in_row == 0) out_norms[row_id] = norm;
+    if (lane_in_row == 0) out_norms[row_id] = __float2half(norm);
     
     const float* d_row = d + lane_in_row * 8;
     #pragma unroll
@@ -399,11 +399,11 @@ __global__ void ultra_fused_hbba_fusion_kernel(
     float b_scale = 1.0f / sqrtf((float)D); 
     float m_base = b_scale * norm;
     float res_sum_sq = 0.0f;
-    float* out_kmse_ptr = out_kmse + row_id * D + lane_in_row * 8;
+    half* out_kmse_ptr = out_kmse + row_id * D + lane_in_row * 8;
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
         float k_mse_val = r[i] * m_base * d_row[i];
-        out_kmse_ptr[i] = k_mse_val;
+        out_kmse_ptr[i] = __float2half(k_mse_val);
         float diff = orig[i] - k_mse_val;
         r[i] = diff * d_row[i]; 
         res_sum_sq += diff * diff;
@@ -413,7 +413,7 @@ __global__ void ultra_fused_hbba_fusion_kernel(
         res_sum_sq += __shfl_down_sync(0xffffffff, res_sum_sq, offset, threads_per_row);
     }
     float r_norm = __shfl_sync(0xffffffff, res_sum_sq > 0 ? sqrtf(res_sum_sq) : 1e-8f, 0, threads_per_row);
-    if (lane_in_row == 0) out_r_norms[row_id] = r_norm;
+    if (lane_in_row == 0) out_r_norms[row_id] = __float2half(r_norm);
 
     // Pass 3: FWHT (Signs)
     #pragma unroll
@@ -457,7 +457,7 @@ std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
     const int D = x.size(1);
     
     auto idx_options = torch::TensorOptions().dtype(torch::kUInt8).device(x.device());
-    auto norm_options = torch::TensorOptions().dtype(torch::kFloat32).device(x.device());
+    auto norm_options = torch::TensorOptions().dtype(torch::kFloat16).device(x.device());
     auto sign_options = torch::TensorOptions().dtype(torch::kFloat16).device(x.device());
 
     torch::Tensor out_idx = torch::empty({N, D}, idx_options);
@@ -477,9 +477,9 @@ std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
         centroids_table.data_ptr<float>(),
         n_centroids_map.data_ptr<int>(),
         out_idx.data_ptr<uint8_t>(), 
-        out_norms.data_ptr<float>(), 
-        out_kmse.data_ptr<float>(),
-        out_r_norms.data_ptr<float>(),
+        (half*)out_norms.data_ptr<at::Half>(), 
+        (half*)out_kmse.data_ptr<at::Half>(),
+        (half*)out_r_norms.data_ptr<at::Half>(),
         (half*)out_signs.data_ptr<at::Half>(),
         D, N
     );
