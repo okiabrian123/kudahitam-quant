@@ -565,9 +565,9 @@ def main():
 
             # Strategies: (Name, Bits, Outlier_Idxs, Use_Outlier, Outlier_P, Outlier_Bits, Frac_Idxs)
             strategies = [
-                ("1-bit Baseline", 1, [], False, 0, 4, []),
-                ("2-bit Baseline", 2, [], False, 0, 4, []),
-                ("HBBA-SymmetryNexus (L1 Masked)", 1.75, [], False, 0, 0, [])
+                ("1-bit (V1)", 1, [], False, 0, 4, []),
+                ("2-bit (V2)", 2, [], False, 0, 4, []),
+                ("1.16-bit SymmetryNexus (V9.2)", 1.75, [], False, 0, 0, [])
             ]
 
             for s_name, b_count, d_set, use_out, d_p, o_bits, f_set in strategies:
