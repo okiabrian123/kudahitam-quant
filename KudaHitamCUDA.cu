@@ -57,7 +57,7 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
     #pragma unroll
     for(int k=0; k<8; ++k) r[k] = (orig[k] * d_row[k]) / norm;
 
-    // 4. Pass 1: FWHT (Forward)
+    // 4. Pass 1: FWHT (Forward) - Unnormalized
     #pragma unroll
     for(int step = 1; step <= 2; step <<= 1) {
         #pragma unroll
@@ -85,8 +85,8 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
         r[j] = a + b; r[j + 4] = a - b;
     }
 
-    // 5. Quantize
-    float f_scale = 1.0f / sqrtf((float)D); 
+    // 5. Quantize - Apply 1/sqrt(D) to match orthonormal centroids
+    float f_scale = 1.0f / sqrtf((float)D);
     uint8_t out_c[8];
     #pragma unroll
     for(int k = 0; k < 8; ++k) {
@@ -136,7 +136,7 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
         r[j] = a + b; r[j + 4] = a - b;
     }
 
-    // 7. Residual & Second Norm
+    // 7. Residual & Second Norm - Correct 1/sqrt(D) Scaling 
     float b_scale = 1.0f / sqrtf((float)D); 
     float m_base = b_scale * norm;
     float res_sum_sq = 0.0f;
