@@ -505,7 +505,7 @@ class KudahitamCompressorHBBA:
         term1 = torch.matmul(queries.half(), k_mse.transpose(-2, -1))
         q_proj = fwht(queries.half() * self.d.to(dev).half()); qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1))
         
-        scale = 1.0 / math.sqrt(self.head_dim); r_norm = compressed["r_norm"].to(dev)
+        scale = 1.0 / self.head_dim; r_norm = compressed["r_norm"].to(dev)
         return term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
 
 
