@@ -11,7 +11,7 @@
  * Bypasses Python-level FP16->FP32 casting floor.
  */
 
-__device__ __forceinline__ __global__ void ultra_fused_full_fusion_kernel_v8(
+__global__ void ultra_fused_full_fusion_kernel_v8(
     const half* __restrict__ x, 
     const float* __restrict__ d, 
     const float* __restrict__ centroids, 
