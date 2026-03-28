@@ -458,7 +458,7 @@ class KudahitamCompressorHBBA:
     @torch.no_grad()
     def compress(self, states: torch.Tensor, offload: bool = True) -> dict:
         if isinstance(states, (list, tuple)): states = states[0]
-        dev = states.device; shape = states.shape; flat = states.reshape(-1, shape[-1])
+        dev = states.device; shape = states.shape; flat = states.reshape(-1, shape[-1]).half()
         cuda_ext = load_cuda_ext()
         
         if not self.is_calibrated:
