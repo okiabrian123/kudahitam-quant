@@ -22,6 +22,30 @@ __device__ __forceinline__ void fwht_warp(float& val, int mask) {
     }
 }
 
+__global__ void fwht_kernel_legacy(float* __restrict__ x, int D, int N) {
+    int row_idx = blockIdx.x;
+    if (row_idx >= N) return;
+    int tid = threadIdx.x;
+    if (tid >= D) return;
+    
+    __shared__ float sdata[1024];
+    float val = x[row_idx * D + tid];
+    
+    fwht_warp(val, 16);
+    sdata[tid] = val; __syncthreads();
+    
+    for (int step = 32; step < D; step <<= 1) {
+        float other = sdata[tid ^ step];
+        if ((tid & step) == 0) val = val + other;
+        else val = other - val;
+        __syncthreads();
+        sdata[tid] = val; __syncthreads();
+    }
+    
+    float scale = 1.0f / sqrtf((float)D);
+    x[row_idx * D + tid] = val * scale;
+}
+
 __global__ void ultra_fused_compress_kernel(
     const float* __restrict__ x, 
     const float* __restrict__ d, 
@@ -91,38 +115,39 @@ __global__ void ultra_fused_compress_kernel(
     out_idx[row_idx * D + tid] = best_idx;
 }
 
-// Host wrapper
+void fwht_cuda_forward(torch::Tensor x) {
+    const int N = x.size(0);
+    const int D = x.size(1);
+    at::cuda::CUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    dim3 blocks(N);
+    dim3 threads(D);
+    fwht_kernel_legacy<<<blocks, threads, 0, stream>>>(x.data_ptr<float>(), D, N);
+}
+
 std::vector<torch::Tensor> ultra_fused_compress_cuda(
     torch::Tensor x, torch::Tensor d, torch::Tensor centroids) 
 {
     const int N = x.size(0);
     const int D = x.size(1);
     const int n_centroids = centroids.size(0);
-    
     auto idx_options = torch::TensorOptions().dtype(torch::kUInt8).device(x.device());
     auto norm_options = torch::TensorOptions().dtype(torch::kFloat32).device(x.device());
-    
     torch::Tensor out_idx = torch::empty({N, D}, idx_options);
     torch::Tensor out_norms = torch::empty({N, 1}, norm_options);
-    
     at::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    
     dim3 blocks(N);
-    dim3 threads(D); // Assumes D <= 1024
-    
+    dim3 threads(D);
     ultra_fused_compress_kernel<<<blocks, threads, 0, stream>>>(
-        x.data_ptr<float>(), 
-        d.data_ptr<float>(), 
-        centroids.data_ptr<float>(), 
-        out_idx.data_ptr<uint8_t>(), 
-        out_norms.data_ptr<float>(), 
+        x.data_ptr<float>(), d.data_ptr<float>(), centroids.data_ptr<float>(), 
+        out_idx.data_ptr<uint8_t>(), out_norms.data_ptr<float>(), 
         D, N, n_centroids
     );
-    
     return {out_idx, out_norms};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("forward", &fwht_cuda_forward, "KudaHitam FWHT Forward (Legacy)");
     m.def("ultra_fused_compress", &ultra_fused_compress_cuda, "KudaHitam Ultra-Fused Compression");
 }
