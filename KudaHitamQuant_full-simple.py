@@ -241,9 +241,6 @@ class KudahitamCompressorV2:
         # Priority: Ultra-Gila Mode (Ultra-Fused: Norm + Scale + FWHT + Quant)
         cuda_ext = load_cuda_ext()
         if CUDA_EXT_AVAILABLE and cuda_ext and states.is_cuda:
-            if not hasattr(self, '_gila_notified'):
-                print(f"[KudaHitam] [✓] Task Compression: Using Warp-Only Register CUDA Kernel (Gila Mode V4).")
-                self._gila_notified = True
             indices, vec_norms = cuda_ext.ultra_fused_compress(flat.contiguous(), self.d.float().contiguous(), self.centroids.to(dev).float().contiguous())
             k_mse = cuda_ext.ultra_fused_reconstruct(indices, vec_norms, self.centroids.to(dev).float().contiguous(), self.d.float().contiguous())
         else:
