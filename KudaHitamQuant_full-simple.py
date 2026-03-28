@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import time
+import numpy as np
 from typing import Optional, Tuple, List, Dict, Any
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
