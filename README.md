@@ -17,7 +17,7 @@ Unlike standard implementations that launch multiple kernels for FWHT, normaliza
 
 The following evaluations were performed on an NVIDIA T4 ($D=128/256$, H=16). Results confirm **Bit-Identity** restoration with our Structured Projections vs standard Gaussian QJL baselines.
 
-| Ctx | Field | Strategy/Bit Mode | Acc (V2/F) | Acc (G) | Comp(V2/F) | Comp(G) | Mem |
+| Ctx | Field | Strategy/Bit Mode | Acc (FWHT) | Acc (Gaussian) | Comp (FWHT) | Comp (G) | Mem |
 | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
 | 10000 | Reasoning | 1-bit Baseline | **0.9977** | 0.9931 | 1.42ms | 0.52ms | 408MB |
 | 10000 | Reasoning | 2-bit Baseline | **0.9993** | 0.9980 | 0.23ms | 0.46ms | 792MB |
