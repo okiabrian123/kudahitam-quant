@@ -227,9 +227,59 @@ std::vector<torch::Tensor> ultra_fused_full_fusion_cuda(
     return {out_idx, out_norms, out_kmse, out_r_norms, out_signs};
 }
 
-void fwht_cuda_forward_warp(torch::Tensor x) {}
+__global__ void fwht_cuda_forward_kernel(float* __restrict__ x, int D, int N) {
+    int global_thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int row_id = (global_thread_id * 8) / D;
+    if (row_id >= N) return;
+    int lane_id = threadIdx.x & 31;
+    int threads_per_row = D / 8; 
+    int lane_in_row = lane_id % threads_per_row;
+    float r[8];
+    float* row_ptr = x + row_id * D + lane_in_row * 8;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) r[i] = row_ptr[i];
+    #pragma unroll
+    for(int step = 1; step <= 2; step <<= 1) {
+        #pragma unroll
+        for(int i = 0; i <= 4; i += 4) {
+            #pragma unroll
+            for(int j = 0; j < 4; ++j) {
+                if ((j & step) == 0) {
+                    float a = r[i+j]; float b = r[i+(j|step)];
+                    r[i+j] = a + b; r[i+(j|step)] = a - b;
+                }
+            }
+        }
+    }
+    for(int t_step = 1; t_step < threads_per_row; t_step <<= 1) {
+        #pragma unroll
+        for(int k = 0; k < 8; ++k) {
+            float other = __shfl_xor_sync(0xffffffff, r[k], t_step, threads_per_row);
+            if ((lane_in_row & t_step) == 0) r[k] = r[k] + other;
+            else r[k] = other - r[k];
+        }
+    }
+    #pragma unroll
+    for(int j = 0; j < 4; ++j) {
+        float a = r[j]; float b = r[j + 4];
+        r[j] = a + b; r[j + 4] = a - b;
+    }
+    float scale = 1.0f / sqrtf((float)D);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) row_ptr[i] = r[i] * scale;
+}
+
+void fwht_cuda_forward(torch::Tensor x) {
+    const int N = x.size(0);
+    const int D = x.size(1);
+    at::cuda::CUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    dim3 threads(256);
+    dim3 blocks((N * D + 2047) / 2048); 
+    fwht_cuda_forward_kernel<<<blocks, threads, 0, stream>>>(x.data_ptr<float>(), D, N);
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &fwht_cuda_forward_warp, "Reserved");
-    m.def("ultra_fused_full_fusion", &ultra_fused_full_fusion_cuda, "KudaHitam God Kernel V8.2 (Strict Isolation)");
+    m.def("forward", &fwht_cuda_forward, "KudaHitam Forward FWHT (Orthonormal)");
+    m.def("ultra_fused_full_fusion", &ultra_fused_full_fusion_cuda, "KudaHitam God Kernel V8.3 (Complete)");
 }
