@@ -305,34 +305,38 @@ class KudahitamCompressorV2:
             else: flat_q[:, self.protected_indices] = 0.0
         else: p_indices = p_norms = None; flat_q = flat
             
-        vec_norms = torch.norm(flat_q, dim=-1, keepdim=True); rotated = fwht((flat_q.float() / (vec_norms + 1e-8)) * self.d)
-        _a = rotated.abs().mean(); _sigma = _a / 0.79788
-        if self.use_dynamic_codebook: centroids = torch.tensor([-_a, _a], device=dev)
-        else: centroids = self.centroids
+        vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)
         
-        if self.use_fractional:
-            split_at = 64 if self.use_ultra else 128
-            c_h = 0.9816 * _sigma; c2 = torch.tensor([-c_h, 0.0, c_h], device=dev)
-            if TRITON_AVAILABLE and rotated.is_cuda:
-                with torch.cuda.device(dev):
-                    i_tmp = torch.empty_like(rotated, dtype=torch.int32).contiguous()
-                    grid = (triton.cdiv(rotated.numel(), 1024),)
-                    fractional_quantize_kernel[grid](rotated.contiguous(), c2.contiguous(), centroids.contiguous(), i_tmp, rotated.numel(), rotated.shape[1], split_at, len(c2), len(centroids), BLOCK_SIZE=1024)
-                    indices = i_tmp.to(torch.uint8)
+        # Priority: Gila Mode Fused Compression (FWHT + Quantization)
+        cuda_ext = load_cuda_ext()
+        if CUDA_EXT_AVAILABLE and cuda_ext and flat_q.is_cuda and not self.use_fractional:
+            if not self.use_dynamic_codebook:
+                x_scaled = (flat_q / (vec_norms + 1e-8)) * self.d
+                indices = cuda_ext.fused_compress(x_scaled.float().contiguous(), self.centroids.float().contiguous())
+                k_mse = fwht(self.centroids[indices.long()]) * self.d * vec_norms
             else:
+                rotated = fwht((flat_q.float() / (vec_norms + 1e-8)) * self.d)
+                _a = rotated.abs().mean(); centroids = torch.tensor([-_a, _a], device=dev)
+                indices = (rotated.unsqueeze(-1) - centroids).abs().argmin(-1).to(torch.uint8)
+                k_mse = fwht(centroids[indices.long()]) * self.d * vec_norms
+        else:
+            # Fallback to Triton/PyTorch
+            rotated = fwht((flat_q.float() / (vec_norms + 1e-8)) * self.d)
+            if self.use_dynamic_codebook:
+                _a = rotated.abs().mean(); centroids = torch.tensor([-_a, _a], device=dev)
+            else: centroids = self.centroids
+            
+            if self.use_fractional:
+                split_at = 64 if self.use_ultra else 128
+                c_h = 0.9816 * (rotated.abs().mean() / 0.79788)
+                c2 = torch.tensor([-c_h, 0.0, c_h], device=dev)
                 idx0 = (rotated[:, :split_at].unsqueeze(-1) - c2).abs().argmin(-1).to(torch.uint8)
                 idx1 = (rotated[:, split_at:].unsqueeze(-1) - centroids).abs().argmin(-1).to(torch.uint8)
                 indices = torch.cat([idx0, idx1], dim=-1)
-            k_mse = fwht(torch.cat([c2[indices[:, :split_at].long()], centroids[indices[:, split_at:].long()]], dim=-1)) * self.d * vec_norms
-        else:
-            indices = torch.empty_like(rotated, dtype=torch.uint8)
-            if TRITON_AVAILABLE and rotated.is_cuda:
-                with torch.cuda.device(dev):
-                    i_tmp = torch.empty_like(rotated, dtype=torch.int32).contiguous()
-                    grid = (triton.cdiv(rotated.numel(), 1024),); quantize_kernel_pure[grid](rotated.contiguous(), centroids.contiguous(), i_tmp, rotated.numel(), len(centroids), BLOCK_SIZE=1024)
-                    indices = i_tmp.to(torch.uint8)
-            else: indices = (rotated.unsqueeze(-1) - centroids).abs().argmin(-1).to(torch.uint8)
-            k_mse = fwht(centroids[indices.long()]) * self.d * vec_norms
+                k_mse = fwht(torch.cat([c2[indices[:, :split_at].long()], centroids[indices[:, split_at:].long()]], dim=-1)) * self.d * vec_norms
+            else:
+                indices = (rotated.unsqueeze(-1) - centroids).abs().argmin(-1).to(torch.uint8)
+                k_mse = fwht(centroids[indices.long()]) * self.d * vec_norms
             
         if self.use_vwh: k_mse = k_mse / self.vwh_weights
         residual = flat_q - k_mse; r_norm = torch.norm(residual, dim=-1); projected = fwht(residual * self.d); signs = (projected >= 0).to(torch.int8) * 2 - 1

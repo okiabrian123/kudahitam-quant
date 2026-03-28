@@ -197,9 +197,18 @@ class KudahitamCompressorV2:
         if isinstance(states, (list, tuple)): states = states[0]
         dev = states.device; shape = [int(v) for v in states.shape]; flat = states.reshape(-1, shape[-1]).float()
         vec_norms = torch.norm(flat, dim=-1, keepdim=True)
-        rotated = fwht((flat.float() / (vec_norms + 1e-8)) * self.d)
-        indices = (rotated.unsqueeze(-1) - self.centroids.to(dev)).abs().argmin(-1).to(torch.uint8)
-        k_mse = fwht(self.centroids.to(dev)[indices.long()]) * self.d * vec_norms
+        
+        # Priority: Gila Mode Fused Compression (FWHT + Quantization)
+        cuda_ext = load_cuda_ext()
+        if CUDA_EXT_AVAILABLE and cuda_ext and flat.is_cuda:
+            x_scaled = (flat.float() / (vec_norms + 1e-8)) * self.d
+            indices = cuda_ext.fused_compress(x_scaled.contiguous(), self.centroids.to(dev).float().contiguous())
+            k_mse = fwht(self.centroids.to(dev)[indices.long()]) * self.d * vec_norms
+        else:
+            rotated = fwht((flat.float() / (vec_norms + 1e-8)) * self.d)
+            indices = (rotated.unsqueeze(-1) - self.centroids.to(dev)).abs().argmin(-1).to(torch.uint8)
+            k_mse = fwht(self.centroids.to(dev)[indices.long()]) * self.d * vec_norms
+            
         residual = flat - k_mse; r_norm = torch.norm(residual, dim=-1); projected = fwht(residual * self.d); signs = (projected >= 0).to(torch.int8) * 2 - 1
         return { "indices": indices, "norms": vec_norms.squeeze(-1).to(torch.float16), "rank": len(shape), "shape": tuple(shape), "r_norm": r_norm.to(torch.float16).reshape(shape[:-1]), "k_mse": k_mse.to(torch.float16).reshape(shape), "signs": signs.reshape(shape) }
 
