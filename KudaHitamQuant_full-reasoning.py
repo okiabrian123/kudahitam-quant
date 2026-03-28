@@ -307,6 +307,8 @@ class KudahitamCompressorV2:
                     grid = (flat_q.shape[0],)
                     mask_outliers_kernel[grid](flat_q, self.protected_indices, flat_q.shape[0], flat_q.shape[1], p_count, BLOCK_SIZE=triton.next_power_of_2(p_count))
             else: flat_q[:, self.protected_indices] = 0.0
+        else: p_indices = p_norms = None; flat_q = flat
+        
         # Priority: Gila Mode V3 (Semi-Fused: FWHT + Quantization + Inline Scaling)
         vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)
         cuda_ext = load_cuda_ext()
