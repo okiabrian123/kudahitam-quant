@@ -358,9 +358,9 @@ class KudahitamCompressorV2:
         return {
             "indices": indices,
             "norms": vec_norms.squeeze(-1),
-            "k_mse": k_mse.view(n_heads, seq_len, head_dim),
-            "r_norm": r_norm.squeeze(-1),
-            "signs": signs.view(n_heads, seq_len, head_dim),
+            "k_mse": k_mse.view(shape),
+            "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]),
+            "signs": signs.view(shape),
             "p_indices": p_indices,
             "p_norms": p_norms.squeeze(-1).float() if p_norms is not None else None,
             "p_idx": self.protected_indices,
