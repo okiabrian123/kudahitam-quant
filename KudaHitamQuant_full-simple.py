@@ -66,22 +66,16 @@ def load_cuda_ext():
             build_dir = os.path.join(current_dir, "cuda_build")
             os.makedirs(build_dir, exist_ok=True)
             try:
-                _KudaHitamCUDA = load(name="KudaHitamCUDA_v3_final", sources=[_src], verbose=True, with_cuda=True, build_directory=build_dir)
+                _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir)
                 CUDA_EXT_AVAILABLE = True
-                print("[KudaHitam] Gila Mode V3 Activated: Raw CUDA Warp-Shuffles Enabled.")
-            except Exception as e:
+                print("[KudaHitam] Gila Mode Activated: Raw CUDA Warp-Shuffles Enabled.")
+            except:
                 try: 
-                    _KudaHitamCUDA = load(name="KudaHitamCUDA_v3_final", sources=[_src], verbose=True, with_cuda=True, build_directory=build_dir, is_python_module=True)
+                    _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir, is_python_module=True)
                     CUDA_EXT_AVAILABLE = True
-                    print("[KudaHitam] Gila Mode V3 Activated: Raw CUDA Warp-Shuffles Enabled.")
-                except Exception as e2:
-                    print(f"[KudaHitam] CUDA Compile Failed! Falling back to Triton. Errors:\n1. {e}\n2. {e2}")
-        else:
-            print(f"[KudaHitam] CUDA source not found or NVCC missing. src exist: {os.path.exists(_src)}, nvcc found: {find_nvcc()}")
+                except: pass
         return _KudaHitamCUDA
-    except Exception as e_out:
-        print(f"[KudaHitam] Unexpected error during CUDA load: {e_out}")
-        return None
+    except: return None
 
 # --- PURE TRITON KERNELS ---
 
@@ -197,19 +191,19 @@ class KudahitamCompressorV2:
             self.centroids = torch.tensor(centroids, dtype=torch.float32).to(device)
             _CENTROID_CACHE[cache_key] = self.centroids.cpu()
 
+        self.d_float = self.d.float().contiguous()
+        self.centroids_float = self.centroids.float().contiguous()
 
     @torch.no_grad()
     def compress(self, states: torch.Tensor, offload: bool = True) -> dict:
         if isinstance(states, (list, tuple)): states = states[0]
         dev = states.device; shape = [int(v) for v in states.shape]; flat = states.reshape(-1, shape[-1]).float()
         
-        # Priority: Gila Mode V3 (Semi-Fused: FWHT + Quantization + Inline Scaling)
-        vec_norms = torch.norm(flat, dim=-1, keepdim=True)
+        # Priority: Ultra-Gila Mode (Ultra-Fused: Norm + Scale + FWHT + Quant)
         cuda_ext = load_cuda_ext()
         if CUDA_EXT_AVAILABLE and cuda_ext and flat.is_cuda:
-            indices = cuda_ext.fused_compress(flat.float().contiguous(), vec_norms.float().contiguous(), self.d.float().contiguous(), self.centroids.to(dev).float().contiguous())
+            indices, vec_norms = cuda_ext.ultra_fused_compress(flat.contiguous(), self.d_float, self.centroids_float if self.centroids_float.device == dev else self.centroids_float.to(dev))
             k_mse = fwht(self.centroids.to(dev)[indices.long()]) * self.d * vec_norms
-
         else:
             # Fallback to standard Gila Mode or Triton/PyTorch
             vec_norms = torch.norm(flat, dim=-1, keepdim=True)
