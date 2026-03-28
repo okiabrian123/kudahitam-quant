@@ -506,8 +506,9 @@ class KudahitamCompressorHBBA:
             return score * compressed["norms"].unsqueeze(-2)
             
         indices = compressed["indices"].to(dev); signs_packed = compressed["signs"].to(dev); norms = compressed["norms"].to(dev)
-        # Reconstruct Base Cache on-the-fly (V8.9.3 Advanced Indexing)
-        k_mse = self.centroids_table[torch.arange(self.head_dim, device=dev), indices.long()]
+        # Reconstruct Base Cache on-the-fly (V8.9.4 Dimension-Robust Gather)
+        B, H, S, D = indices.shape
+        k_mse = self.centroids_table.gather(1, indices.long().reshape(-1, D).T).T.reshape(B, H, S, D)
         k_mse = k_mse * norms.unsqueeze(-1) * (1.0 / self.head_dim)
         # Unpack 1-bit signs (V8.8.0 Bit-Stream Engine)
         signs = (((signs_packed.unsqueeze(-1) >> torch.arange(8, device=dev)) & 1).half() * 2 - 1)
