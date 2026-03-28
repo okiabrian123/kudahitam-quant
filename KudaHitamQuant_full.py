@@ -499,7 +499,7 @@ class KudahitamCompressorHBBA:
             
         k_mse = compressed["k_mse"].to(dev); signs_packed = compressed["signs"].to(dev)
         # Unpack 1-bit signs (V8.8.0 Bit-Stream Engine)
-        signs = (((signs_packed.unsqueeze(-1) >> torch.arange(8, device=dev)) & 1).float() * 2 - 1)
+        signs = (((signs_packed.unsqueeze(-1) >> torch.arange(8, device=dev)) & 1).half() * 2 - 1)
         signs = signs.view(queries.shape[:-2] + (-1, self.head_dim)) # (B, H, S, D)
         
         term1 = torch.matmul(queries.half(), k_mse.transpose(-2, -1))

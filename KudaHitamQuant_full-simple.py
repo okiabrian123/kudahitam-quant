@@ -304,8 +304,8 @@ class KudahitamCompressorHBBA:
             
         k_mse = compressed["k_mse"].to(dev); signs_packed = compressed["signs"].to(dev)
         # Unpack 1-bit signs (V8.8.0 Bit-Stream Engine)
-        signs = (((signs_packed.unsqueeze(-1) >> torch.arange(8, device=dev)) & 1).float() * 2 - 1)
-        signs = signs.view(queries.shape[:-2] + (-1, self.head_dim)) # (B, H, S, D)
+        signs = (((signs_packed.unsqueeze(-1) >> torch.arange(8, device=dev)) & 1).half() * 2 - 1)
+        signs = signs.view(queries.shape[:-2] + (-1, self.head_dim))
         
         term1 = torch.matmul(queries.half(), k_mse.transpose(-2, -1)); q_proj = fwht(queries.half() * self.d.to(dev).half()); qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1))
         scale = 1.0 / math.sqrt(self.head_dim); r_norm = compressed["r_norm"].to(dev); return term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
