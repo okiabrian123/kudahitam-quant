@@ -460,8 +460,12 @@ __global__ void ultra_fused_hbba_fusion_kernel(
 }
 
 std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
-    torch::Tensor x, torch::Tensor d, torch::Tensor centroids_table, torch::Tensor mask) 
+    torch::Tensor x, torch::Tensor d, torch::Tensor centroids_table, torch::Tensor mask,
+    int layer_id, uint8_t active_mask) 
 {
+    if (!((active_mask >> layer_id) & 1)) {
+        // Return dummy or handle baseline in Python
+    }
     const int N = x.size(0);
     const int D = x.size(1);
     
@@ -569,7 +573,9 @@ __global__ void hbba_calibrate_cuda_kernel(
     }
 }
 
-torch::Tensor hbba_calibrate_cuda(torch::Tensor sample, torch::Tensor n_map) {
+torch::Tensor hbba_calibrate_cuda(torch::Tensor sample, torch::Tensor n_map, int layer_id, uint8_t active_mask) {
+    if (!((active_mask >> layer_id) & 1)) return torch::zeros({sample.size(1), 16}, torch::TensorOptions().device(sample.device()));
+    
     int N = sample.size(0);
     int D = sample.size(1);
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(sample.device());
@@ -722,7 +728,8 @@ __global__ void asymmetric_score_kernel(
 // --- Wrappers ---
 
 std::vector<torch::Tensor> packed_hbba_fusion_cuda(
-    torch::Tensor x, torch::Tensor d_vec, torch::Tensor centroids, torch::Tensor mask) {
+    torch::Tensor x, torch::Tensor d_vec, torch::Tensor centroids, torch::Tensor mask,
+    int layer_id, uint8_t active_mask) {
     int N = x.size(0); int D = x.size(1);
     auto options = torch::TensorOptions().device(x.device());
     auto out_packed = torch::zeros({N, 56}, options.dtype(torch::kUInt8));
@@ -732,11 +739,13 @@ std::vector<torch::Tensor> packed_hbba_fusion_cuda(
     auto out_signs = torch::zeros({N, D}, options.dtype(torch::kHalf));
 
     at::cuda::CUDAGuard device_guard(x.device());
-    packed_hbba_fusion_kernel<<<N, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (const half*)x.data_ptr<at::Half>(), d_vec.data_ptr<float>(), centroids.data_ptr<float>(),
-        (const uint32_t*)mask.data_ptr<int>(), out_packed.data_ptr<uint8_t>(),
-        out_norms.data_ptr<float>(), out_kmse.data_ptr<float>(), out_r_norms.data_ptr<float>(), (half*)out_signs.data_ptr<at::Half>(), D, N
-    );
+    if ((active_mask >> layer_id) & 1) {
+        packed_hbba_fusion_kernel<<<N, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+            (const half*)x.data_ptr<at::Half>(), d_vec.data_ptr<float>(), centroids.data_ptr<float>(),
+            (const uint32_t*)mask.data_ptr<int>(), out_packed.data_ptr<uint8_t>(),
+            out_norms.data_ptr<float>(), out_kmse.data_ptr<float>(), out_r_norms.data_ptr<float>(), (half*)out_signs.data_ptr<at::Half>(), D, N
+        );
+    }
     return {out_packed, out_norms, out_kmse, out_r_norms, out_signs};
 }
 

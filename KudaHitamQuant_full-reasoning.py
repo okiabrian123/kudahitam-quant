@@ -297,36 +297,140 @@ class KudahitamCompressorV2:
                     for i in range(n_levels): a, b = edges[i], edges[i+1]; num, _ = integrate.quad(lambda x: x*pdf(x), a, b); den, _ = integrate.quad(pdf, a, b); new_c.append(num / den if den > 1e-15 else centroids[i])
                     if max(abs(new_c[i] - centroids[i]) for i in range(n_levels)) < 1e-10: break
                     centroids = new_c
-class KudahitamCompressorBaseline:
-    """Modernized 1-bit/2-bit Baseline (Symmetry Nexus V9.1)"""
-    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu"):
-        self.head_dim = head_dim; self.bits = bits; self.device = device; self.seed = seed
-        self.d = (torch.randint(0, 2, (head_dim,), generator=torch.Generator().manual_seed(seed)) * 2 - 1).float().to(device)
-        # Accurate Lloyd-Max Centroids for 1-bit/2-bit
-        n_levels = 1 << bits; sigma = 1.0 / math.sqrt(head_dim)
-        self.centroids = torch.linspace(-3.0 * sigma, 3.0 * sigma, n_levels).to(device)
+            self.centroids = torch.tensor(centroids, dtype=torch.float32).to(device)
+            _CENTROID_CACHE[cache_key] = self.centroids.cpu()
+        # Recursive QJL for protection (Mini-Turbo)
+        self.p_centroids = None; self.p_Pi = None; self.p_norms = None
+        # Walsh-Sequency ordering for Spectral JPEG
+        _idx = torch.arange(head_dim); _gray = _idx ^ (_idx >> 1); _rev = 0
+        for _i in range(int(math.log2(head_dim))): _rev = (_rev << 1) | ((_gray >> _i) & 1)
+        self.walsh_indices = _rev.to(device)
+
+    def _init_mini_qjl(self, p_dim: int, seed: int, device: str, p_bits: int):
+        if p_dim <= 0: return
+        key = (p_dim, p_bits)
+        if not hasattr(self, "_p_cache"): self._p_cache = {}
+        if key in self._p_cache:
+            self.p_Pi, self.p_centroids = self._p_cache[key]; return
+        
+        gen = torch.Generator(device="cpu").manual_seed(seed + 99)
+        G = torch.randn(p_dim, p_dim, generator=gen); Q, R = torch.linalg.qr(G); d_s = torch.sign(torch.diag(R)); d_s[d_s==0] = 1.0; self.p_Pi = (Q * d_s.unsqueeze(0)).to(device)
+        
+        # Restore Gaussian Centroids for robust outlier protection
+        sigma = 1.0 / math.sqrt(p_dim); n_levels = 1 << p_bits; lo, hi = -3.5 * sigma, 3.5 * sigma
+        centroids = torch.linspace(lo, hi, n_levels).to(device)
+        self.p_centroids = centroids; self._p_cache[key] = (self.p_Pi, self.p_centroids)
 
     @torch.no_grad()
     def compress(self, states: torch.Tensor, offload: bool = True) -> dict:
         if isinstance(states, (list, tuple)): states = states[0]
-        dev = states.device; shape = states.shape; flat = states.reshape(-1, shape[-1]).half()
+        dev = states.device; shape = [int(v) for v in states.shape]; flat = states.reshape(-1, shape[-1]).half()
+        # Random sampling for variance (1024 tokens for speed + accuracy)
+        s_size = min(1024, flat.shape[0]); s_idx = torch.randint(0, flat.shape[0], (s_size,), device=dev) if s_size < flat.shape[0] else slice(None)
+        
+        if self.use_vwh:
+            v_dims = flat[s_idx].var(0); self.vwh_weights = 1.0 / (torch.sqrt(v_dims) + 1e-8); flat = flat * self.vwh_weights
+        
+        if not self.use_outlier: p_count = 0
+        elif self.is_domain_layer: p_count = self.domain_p_count
+        else: p_count = self.protected_dim_count
+            
+        if p_count > 0:
+            if self.protected_indices is None or len(self.protected_indices) != p_count:
+                v_local = flat[s_idx].var(0)
+                if self.use_spectral: self.protected_indices = self.walsh_indices[:p_count]
+                elif self.use_spaced: self.protected_indices = torch.linspace(0, flat.shape[-1]-1, steps=p_count, device=dev).long()
+                else: self.protected_indices = torch.topk(v_local, p_count).indices
+            p_vals_raw = flat[:, self.protected_indices]; self._init_mini_qjl(p_count, 0, str(dev), self.p_bits)
+            p_norms = torch.norm(p_vals_raw, dim=-1, keepdim=True); p_rotated = (p_vals_raw / (p_norms + 1e-8)) @ self.p_Pi.T
+            p_indices = (p_rotated.unsqueeze(-1) - self.p_centroids).abs().argmin(-1).to(torch.uint8)
+            flat_q = flat.clone()
+            if TRITON_AVAILABLE and flat_q.is_cuda:
+                with torch.cuda.device(dev):
+                    grid = (flat_q.shape[0],)
+                    mask_outliers_kernel[grid](flat_q, self.protected_indices, flat_q.shape[0], flat_q.shape[1], p_count, BLOCK_SIZE=triton.next_power_of_2(p_count))
+            else: flat_q[:, self.protected_indices] = 0.0
+        else: p_indices = p_norms = None; flat_q = flat
+            
+        # V8.0 God Kernel: Fused Indices, Norms, K_MSE, R_Norms, and Signs
         cuda_ext = load_cuda_ext()
-        # Use the high-performance ultra_fused_full_fusion kernel
-        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_full_fusion(flat.contiguous(), self.d.to(dev).float().contiguous(), self.centroids.float().contiguous())
-        return { "indices": indices, "norms": vec_norms.squeeze(-1), "k_mse": k_mse.view(shape), "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]), "signs": signs.view(shape), "shape": tuple(shape) }
+        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_full_fusion(flat_q.contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
+        
+        return {
+            "indices": indices,
+            "norms": vec_norms.squeeze(-1),
+            "k_mse": k_mse.view(shape),
+            "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]),
+            "signs": signs.view(shape),
+            "p_indices": p_indices,
+            "p_norms": p_norms.squeeze(-1).float() if p_norms is not None else None,
+            "p_idx": self.protected_indices,
+            "rank": len(shape),
+            "shape": tuple(shape),
+            "is_domain": self.is_domain_layer
+        }
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:
         dev = queries.device; k_mse = compressed["k_mse"].to(dev).float(); signs = compressed["signs"].to(dev).float(); r_norm = compressed["r_norm"].to(dev).float()
         term1 = torch.matmul(queries.float(), k_mse.transpose(-2, -1))
-        q_proj = fwht(queries.float() * self.d.to(dev)); qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1))
+        q_proj = fwht(queries.float() * self.d); qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1))
         scale = 1.0 / math.sqrt(self.head_dim); out = term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
+        
+        if compressed.get("p_indices") is not None:
+            idx = compressed["p_idx"]; B, Sk = compressed["shape"][0], compressed["shape"][-2]
+            p_indices = compressed["p_indices"].long(); p_norms = compressed["p_norms"].float().reshape(-1, 1)
+            self._init_mini_qjl(len(idx), 0, str(dev), self.p_bits) # Re-initialize p_Pi/p_centroids if needed
+            p_recon = (self.p_centroids[p_indices] @ self.p_Pi) * p_norms
+            k_p = p_recon.view(B, -1, Sk, len(idx)); q_p = queries[..., idx].float()
+            term3 = torch.matmul(q_p, k_p.transpose(-2, -1)); out += term3
         return out
 
+# Baseline unchanged (Gaussian)
+class KudahitamCompressorGaussian:
+    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu", 
+                 outlier_threshold: Optional[float] = None,
+                 protected_dim_count: int = 0):
+        self.head_dim = head_dim; self.bits = bits; self.device = device; self.outlier_threshold = outlier_threshold; self.protected_dim_count = protected_dim_count; self.protected_indices = None
+        gen = torch.Generator(device="cpu").manual_seed(seed); G = torch.randn(head_dim, head_dim, generator=gen); Q, R = torch.linalg.qr(G); d_s = torch.sign(torch.diag(R)); d_s[d_s==0] = 1.0; self.Pi = (Q * d_s.unsqueeze(0)).to(device)
+        from scipy import integrate; n_levels = 1 << bits; sigma = 1.0 / math.sqrt(head_dim)
+        def pdf(x): return (1.0 / math.sqrt(2 * math.pi * sigma ** 2)) * math.exp(-x * x / (2 * sigma ** 2))
+        lo, hi = -3.5 * sigma, 3.5 * sigma
+        centroids = [lo + (hi - lo) * (i + 0.5) / n_levels for i in range(n_levels)]
+        for _ in range(200):
+            boundaries = [(centroids[i] + centroids[i+1]) / 2.0 for i in range(n_levels - 1)]; edges = [lo * 3] + boundaries + [hi * 3]; new_c = []
+            for i in range(n_levels): a, b = edges[i], edges[i+1]; num, _ = integrate.quad(lambda x: x*pdf(x), a, b); den, _ = integrate.quad(pdf, a, b); new_c.append(num / den if den > 1e-15 else centroids[i])
+            if max(abs(new_c[i] - centroids[i]) for i in range(n_levels)) < 1e-10: break
+            centroids = new_c
+        self.centroids = torch.tensor(centroids, dtype=torch.float32).to(device)
+    @torch.no_grad()
+    def compress(self, states: torch.Tensor, offload: bool = True) -> dict:
+        if isinstance(states, (list, tuple)): states = states[0]
+        dev = states.device; shape = [int(v) for v in states.shape]; flat = states.reshape(-1, shape[-1]).float()
+        if self.Pi.device != dev: self.Pi = self.Pi.to(dev)
+        if self.centroids.device != dev: self.centroids = self.centroids.to(dev)
+        if self.protected_dim_count > 0:
+            if self.protected_indices is None: v_dims = flat.var(0); self.protected_indices = torch.topk(v_dims, self.protected_dim_count).indices
+            p_vals = flat[:, self.protected_indices].to(torch.float16); flat_q = flat.clone(); flat_q[:, self.protected_indices] = 0.0
+        else: p_vals = None; flat_q = flat
+            
+        vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)
+        rotated = (flat_q / (vec_norms + 1e-8)) @ self.Pi.T
+        indices = (rotated.unsqueeze(-1) - self.centroids).abs().argmin(-1).to(torch.uint8)
+        k_mse = (self.centroids[indices.long()] @ self.Pi) * vec_norms
+        return { "indices": indices, "norms": vec_norms.squeeze(-1).to(torch.float16), "p_vals": p_vals, "p_idx": self.protected_indices, "rank": len(shape), "shape": tuple(shape), "k_mse": k_mse.to(torch.float16).reshape(shape) }
+
+    @torch.no_grad()
+    def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:
+        dev = queries.device; k_mse = compressed["k_mse"].to(dev).float(); term1 = torch.matmul(queries.float(), k_mse.transpose(-2, -1)); out = term1
+        if compressed.get("p_vals") is not None:
+            idx = compressed["p_idx"]; B_idx, Sk_idx = compressed["shape"][0], compressed["shape"][-2]; q_p = queries[..., idx].float(); k_p = compressed["p_vals"].to(dev).float().reshape(B_idx, -1, Sk_idx, len(idx)).squeeze(1); out += torch.matmul(q_p, k_p.transpose(-2, -1))
+        return out
 
 class KudahitamCompressorHBBA:
-    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu", hbba_4bit_ratio: float = 0.25):
+    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu", hbba_4bit_ratio: float = 0.25, layer_id: int = 0, active_mask: int = 0xFF):
         self.head_dim = head_dim; self.seed = seed; self.device = device; self.hbba_4bit_ratio = hbba_4bit_ratio
+        self.layer_id = layer_id; self.active_mask = active_mask
         self.d = (torch.randint(0, 2, (head_dim,), generator=torch.Generator().manual_seed(seed)) * 2 - 1).float().to(device)
         self.centroids_table = None; self.n_centroids_map = None; self.hbba_mask = None; self.is_calibrated = False
 
@@ -346,7 +450,7 @@ class KudahitamCompressorHBBA:
 
         # 2. Atomic CUDA Calibrator (Lloyd-Max in GPU SRAM)
         cuda_ext = load_cuda_ext()
-        self.centroids_table = cuda_ext.hbba_calibrate_cuda(sample_rotated.float().contiguous(), self.n_centroids_map.contiguous())
+        self.centroids_table = cuda_ext.hbba_calibrate_cuda(sample_rotated.float().contiguous(), self.n_centroids_map.contiguous(), self.layer_id, self.active_mask)
         self.is_calibrated = True
 
     @torch.no_grad()
@@ -374,8 +478,8 @@ class KudahitamCompressorHBBA:
         dev = states.device; shape = states.shape; flat = states.reshape(-1, shape[-1]).half()
         cuda_ext = load_cuda_ext()
         if not self.is_calibrated: self.calibrate(states)
-        # Call with hbba_mask instead of the full map
-        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.hbba_mask)
+        # Call with layer_id and active_mask
+        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.hbba_mask, self.layer_id, self.active_mask)
         return { "indices": indices, "norms": vec_norms.squeeze(-1), "k_mse": k_mse.view(shape), "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]), "signs": signs.view(shape), "shape": tuple(shape) }
 
     @torch.no_grad()
@@ -418,7 +522,7 @@ def main():
 
     print(f"Warming up GPU kernels ({model.device})..."); d_k = torch.randn(1, 1, 128, head_dim).to(model.device).half(); d_q = torch.randn(1, 1, 1, head_dim).to(model.device).half()
     for _ in range(5):
-        for CC in [KudahitamCompressorBaseline, KudahitamCompressorHBBA]:
+        for CC in [KudahitamCompressorV2, KudahitamCompressorGaussian]:
             comp = CC(head_dim, 1, seed=0, device=model.device); c = comp.compress(d_k, offload=False); _ = comp.asymmetric_attention_scores(d_q, c)
     
     benchmark_tasks = [
@@ -455,63 +559,52 @@ def main():
             
             # --- ACTIVE INDICES & RANKING ---
             active_indices = [l for l, k in enumerate(gpu_c) if k is not None]
-            layer_variances = []
-            for l_idx in active_indices:
-                keys = gpu_c[l_idx]
-                if isinstance(keys, (tuple, list)): keys = keys[0]
-                curr_h_dim = keys.shape[-1]
-                flat = keys.reshape(-1, curr_h_dim).float()
-                v_dims = flat.var(0); ratio = (v_dims.max() / (v_dims.mean() + 1e-8)).item()
-                layer_variances.append((l_idx, ratio))
-            layer_variances.sort(key=lambda x: x[1], reverse=True)
-            ranked_active = [x[0] for x in layer_variances]
-            
-            # --- SELECTIVE LAYERS & MASK (V9.1) ---
-            # 3 Delta (Top Variety) + 1 Biasa (Middle Layer) = 4 Layers
-            top3_sens = ranked_active[:3]; mid_act = active_indices[len(active_indices)//2]
-            selective_set = set(top3_sens + [mid_act])
-            l_mask = 0
-            for idx in selective_set: l_mask |= (1 << (active_indices.index(idx) % 8)) # 8-bit L-Mask
+            # User Constraint: 6 layers active (3 Delta + 1 KV-Base + 2 extra for 6-layer feel)
+            # We use a 8-bit mask: 0b00111111 (First 6 layers active for demonstration)
+            L1_ACTIVE_MASK = 0b00111111 
 
-            # Strategies: (Name, Bits, Is_HBBA, Is_Selective)
+            # Strategies: (Name, Bits, Outlier_Idxs, Use_Outlier, Outlier_P, Outlier_Bits, Frac_Idxs)
             strategies = [
-                ("1-bit Baseline", 1, False, False),
-                ("2-bit Baseline", 2, False, False),
-                ("HBBA Full (1.75-bit)", 1.75, True, False),
-                ("Selective HBBA (3D+1B)", 1.75, True, True)
+                ("1-bit Baseline", 1, [], False, 0, 4, []),
+                ("2-bit Baseline", 2, [], False, 0, 4, []),
+                ("HBBA-SymmetryNexus (L1 Masked)", 1.75, [], False, 0, 0, [])
             ]
 
-            for s_name, b_count, is_hbba_strat, is_selective in strategies:
-                res_row = {}; mem_total = 0; cos_l, comp_l = [], []
-                for l_idx, keys in enumerate(gpu_c):
-                    if keys is None: continue 
-                    if isinstance(keys, (tuple, list)): keys = keys[0]
-                    B, H, S, D = keys.shape
-                    q = (keys[:, :, -1:, :] if keys.ndim == 4 else keys[:, -1:, :]).float()
-                    real = torch.matmul(q, (keys_f := keys.float()).transpose(-2, -1))
-                    
-                    # Layer-Aware Selection logic
-                    in_s_set = ( (l_mask >> (active_indices.index(l_idx) % 8)) & 1 ) if (is_selective and l_idx in active_indices) else False
-                    
-                    if is_hbba_strat and (not is_selective or in_s_set):
-                        comp = KudahitamCompressorHBBA(D, b_count, seed=l_idx, device=model.device, hbba_4bit_ratio=0.25)
-                        b_eff = 1.75
-                    else:
-                        comp = KudahitamCompressorBaseline(D, b_count, seed=l_idx, device=model.device)
-                        b_eff = b_count
-                    
-                    if hasattr(comp, 'calibrate'): comp.calibrate(keys) 
-                    mem_total += ((b_eff * D / 8) + 2) * H
-                    
-                    torch.cuda.synchronize(); t0 = time.perf_counter()
-                    c = comp.compress(keys, offload=False); torch.cuda.synchronize()
-                    comp_l.append(time.perf_counter() - t0)
-                    s = comp.asymmetric_attention_scores(q, c)
-                    cos_l.append(F.cosine_similarity(real.flatten(), s.flatten(), dim=0))
-                
-                acc = torch.stack(cos_l).mean().item(); ms = (sum(comp_l)/len(comp_l))*1000
-                print(f"Done: {ctx} | {task_name} | {s_name} | Acc: {acc:.4f} | {ms:.2f}ms")
-                all_results.append((ctx, task_name, s_name, acc, 0.0, ms, 0.0, mem_total))
+            for s_name, b_count, d_set, use_out, d_p, o_bits, f_set in strategies:
+                res_row = {}; mem_total = 0
+                for ver in ["V2", "Gaussian"]:
+                    if "HBBA" in s_name and ver == "Gaussian":
+                        res_row[ver] = {"acc": 0.0, "ms": 0.0}; continue
+                        
+                    CompClass = KudahitamCompressorV2 if ver == "V2" else KudahitamCompressorGaussian; cos_l, comp_l = [], []
+                    for l_idx, keys in enumerate(gpu_c):
+                        if keys is None: continue 
+                        if isinstance(keys, (tuple, list)): keys = keys[0]
+                        B, H, S, D = keys.shape
+                        q = (keys[:, :, -1:, :] if keys.ndim == 4 else keys[:, -1:, :]).float()
+                        real = torch.matmul(q, (keys_f := keys.float()).transpose(-2, -1))
+                        
+                        if "HBBA" in s_name:
+                            # Symmetry Nexus V9.2: Autonomous Layer-Mask Dispatch
+                            comp = KudahitamCompressorHBBA(D, b_count, seed=l_idx, device=model.device, hbba_4bit_ratio=0.25, layer_id=l_idx, active_mask=L1_ACTIVE_MASK)
+                            comp.calibrate(keys) 
+                            # Logic: If mask is 0, effective bits = 1.0. If 1, effective = 1.75
+                            b_eff = 1.75 if (L1_ACTIVE_MASK >> l_idx) & 1 else 1.0
+                            l_base = (b_eff * D / 8) + 2
+                            mem_total += l_base * H
+                        elif ver == "V2":
+                            is_d = (l_idx in d_set); is_f = (l_idx in f_set)
+                            comp = CompClass(D, b_count, seed=l_idx, device=model.device, is_domain_layer=is_d, use_outlier=use_out, domain_p_count=(d_p if is_d else 0), p_bits=o_bits)
+                            b_eff = b_count
+                            l_base = (b_eff * D / 8) + 2
+                            mem_total += l_base * H
+                        else:
+                            comp = CompClass(D, b_count, seed=l_idx, device=model.device)
+                            
+                        torch.cuda.synchronize(); t0 = time.perf_counter(); c = comp.compress(keys, offload=False); torch.cuda.synchronize(); comp_l.append(time.perf_counter() - t0); s = comp.asymmetric_attention_scores(q, c); cos_l.append(F.cosine_similarity(real.flatten(), s.flatten(), dim=0))
+                    res_row[ver] = {"acc": (torch.stack(cos_l).mean().item()), "ms": (sum(comp_l)/len(comp_l))*1000}
+                print(f"Done: {ctx} | {task_name} | {s_name}")
+                all_results.append((ctx, task_name, s_name, res_row['V2']['acc'], res_row['Gaussian']['acc'], res_row['V2']['ms'], res_row['Gaussian']['ms'], mem_total))
 
     # --- FINAL CONSOLIDATED DISPLAY ---
     print("\n" + "=" * 165)
