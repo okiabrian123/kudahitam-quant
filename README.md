@@ -17,16 +17,24 @@ Unlike standard implementations that launch multiple kernels for FWHT, normaliza
 
 The following evaluations were performed on an NVIDIA T4 ($D=128/256$, H=16). Results confirm **Bit-Identity** restoration with our Structured Projections vs standard Gaussian QJL baselines.
 
-| Ctx | Task | Mode | Acc (God Kernel V8.3) | Acc (Gaussian Baseline) | Comp Latency |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| 10k | Reasoning | 1-bit | **0.9977** | 0.9931 | < 0.2ms |
-| 10k | Reasoning | 2-bit | **0.9993** | 0.9980 | < 0.2ms |
-| 10k | Math | 1-bit | **0.9977** | 0.9931 | < 0.2ms |
-| 10k | Math | 2-bit | **0.9993** | 0.9981 | < 0.2ms |
-| 40k | Reasoning | 1-bit | **0.9973** | 0.9917 | < 0.2ms |
-| 40k | Reasoning | 2-bit | **0.9992** | 0.9977 | < 0.2ms |
-| 40k | Coding | 1-bit | **0.9971** | 0.9910 | < 0.2ms |
-| 40k | Coding | 2-bit | **0.9991** | 0.9975 | < 0.2ms |
+| Ctx | Field | Strategy/Bit Mode | Acc (V2/F) | Acc (G) | Comp(V2/F) | Comp(G) | Mem |
+| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| 10000 | Reasoning | 1-bit Baseline | **0.9977** | 0.9931 | 1.42ms | 0.52ms | 408MB |
+| 10000 | Reasoning | 2-bit Baseline | **0.9993** | 0.9980 | 0.23ms | 0.46ms | 792MB |
+| 10000 | Math | 1-bit Baseline | **0.9977** | 0.9931 | 0.24ms | 0.48ms | 408MB |
+| 10000 | Math | 2-bit Baseline | **0.9993** | 0.9981 | 0.28ms | 0.48ms | 792MB |
+| 10000 | Story | 1-bit Baseline | **0.9976** | 0.9928 | 0.27ms | 0.56ms | 408MB |
+| 10000 | Story | 2-bit Baseline | **0.9993** | 0.9980 | 0.24ms | 0.50ms | 792MB |
+| 10000 | Coding | 1-bit Baseline | **0.9976** | 0.9930 | 0.26ms | 0.50ms | 408MB |
+| 10000 | Coding | 2-bit Baseline | **0.9993** | 0.9980 | 0.24ms | 0.47ms | 792MB |
+| 40000 | Reasoning | 1-bit Baseline | **0.9973** | 0.9917 | 0.26ms | 0.47ms | 408MB |
+| 40000 | Reasoning | 2-bit Baseline | **0.9992** | 0.9977 | 0.22ms | 0.47ms | 792MB |
+| 40000 | Math | 1-bit Baseline | **0.9971** | 0.9910 | 0.24ms | 0.54ms | 408MB |
+| 40000 | Math | 2-bit Baseline | **0.9991** | 0.9975 | 0.22ms | 0.46ms | 792MB |
+| 40000 | Story | 1-bit Baseline | **0.9972** | 0.9912 | 0.25ms | 0.52ms | 408MB |
+| 40000 | Story | 2-bit Baseline | **0.9991** | 0.9976 | 0.24ms | 0.45ms | 792MB |
+| 40000 | Coding | 1-bit Baseline | **0.9971** | 0.9910 | 0.25ms | 0.51ms | 408MB |
+| 40000 | Coding | 2-bit Baseline | **0.9991** | 0.9975 | 0.21ms | 0.45ms | 792MB |
 
 > [!TIP]
 > **Performance Note**: Latency results include the full monolithic pipeline. The structured FWHT approach (`O(D log D)`) scales linearly with the latent dimension while retaining significantly higher semantic fidelity than random projections.
