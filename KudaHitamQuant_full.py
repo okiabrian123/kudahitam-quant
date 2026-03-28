@@ -497,11 +497,11 @@ class KudahitamCompressorHBBA:
             score = torch.matmul(q_proj, compressed["quantized"].half().transpose(-2, -1))
             return score * compressed["norms"].unsqueeze(-2)
             
-        k_mse = compressed["k_mse"].to(dev); signs = compressed["signs"].to(dev); r_norm = compressed["r_norm"].to(dev)
+        k_mse = compressed["k_mse"].to(dev); signs = compressed["signs"].to(dev)
         term1 = torch.matmul(queries.half(), k_mse.transpose(-2, -1))
         q_proj = fwht(queries.half() * self.d.to(dev).half()); qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1))
-        scale = 1.0 / math.sqrt(self.head_dim); out = term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
-        return out
+        # Total recovery: term1 (base) + qjl_ip (orthonormal residual)
+        return term1 + qjl_ip
 
 
 # =============================================================================

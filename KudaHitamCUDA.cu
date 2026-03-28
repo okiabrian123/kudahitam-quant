@@ -459,10 +459,11 @@ __global__ void ultra_fused_hbba_fusion_kernel(
         r[j] = a + b; r[j + 4] = a - b;
     }
 
-    half* out_half_signs = ((half*)out_signs) + row_id * D + lane_in_row * 8;
+    half* out_half_signs = out_signs + row_id * D + lane_in_row * 8;
+    float final_scale = 1.0f / sqrtf((float)D);
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        out_half_signs[i] = __float2half(r[i]);
+        out_half_signs[i] = __float2half(r[i] * final_scale);
     }
 }
 
