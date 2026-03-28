@@ -497,8 +497,110 @@ std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
     return {out_idx, out_norms, out_kmse, out_r_norms, out_signs};
 }
 
+__global__ void hbba_calibrate_cuda_kernel(
+    const float* __restrict__ sample, // [N, D]
+    float* __restrict__ centroids,   // [D, 16]
+    const int* __restrict__ n_map,    // [D]
+    int N, int D) 
+{
+    int d = blockIdx.x;
+    if (d >= D) return;
+    int n_c = n_map[d];
+
+    __shared__ float s_data[1024];
+    __shared__ float s_centroids[16];
+    __shared__ float s_sums[16];
+    __shared__ int s_counts[16];
+
+    // 1. Parallel Load Sample Data to SRAM
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        s_data[i] = sample[i * D + d];
+    }
+    __syncthreads();
+
+    // 2. Initial Min-Max for Uniform Init
+    float min_val = 1e18f, max_val = -1e18f;
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        float val = s_data[i];
+        min_val = fminf(min_val, val);
+        max_val = fmaxf(max_val, val);
+    }
+    
+    // Reduction in Shared Memory
+    __shared__ float rs_min[128], rs_max[128];
+    rs_min[threadIdx.x] = min_val;
+    rs_max[threadIdx.x] = max_val;
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            rs_min[threadIdx.x] = fminf(rs_min[threadIdx.x], rs_min[threadIdx.x + s]);
+            rs_max[threadIdx.x] = fmaxf(rs_max[threadIdx.x], rs_max[threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    
+    if (threadIdx.x == 0) {
+        float b_min = rs_min[0];
+        float b_max = rs_max[0];
+        for (int i = 0; i < n_c; ++i) {
+            s_centroids[i] = b_min + (float)i * (b_max - b_min) / (float)fmaxf(1.0f, (float)(n_c - 1));
+        }
+    }
+    __syncthreads();
+
+    // 3. Lloyd-Max Iterations
+    for (int iter = 0; iter < 10; ++iter) {
+        if (threadIdx.x < 16) { s_sums[threadIdx.x] = 0.0f; s_counts[threadIdx.x] = 0; }
+        __syncthreads();
+
+        for (int i = threadIdx.x; i < N; i += blockDim.x) {
+            float val = s_data[i];
+            int best_c = 0; float min_d = 1e18f;
+            for (int c = 0; c < n_c; ++c) {
+                float dist = fabsf(val - s_centroids[c]);
+                if (dist < min_d) { min_d = dist; best_c = c; }
+            }
+            atomicAdd(&s_sums[best_c], val);
+            atomicAdd(&s_counts[best_c], 1);
+        }
+        __syncthreads();
+
+        if (threadIdx.x < n_c) {
+            if (s_counts[threadIdx.x] > 0) s_centroids[threadIdx.x] = s_sums[threadIdx.x] / (float)s_counts[threadIdx.x];
+        }
+        __syncthreads();
+    }
+
+    // 4. Write back
+    if (threadIdx.x < n_c) {
+        centroids[d * 16 + threadIdx.x] = s_centroids[threadIdx.x];
+    }
+}
+
+torch::Tensor hbba_calibrate_cuda(torch::Tensor sample, torch::Tensor n_map) {
+    int N = sample.size(0);
+    int D = sample.size(1);
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(sample.device());
+    torch::Tensor centroids = torch::zeros({D, 16}, options);
+
+    at::cuda::CUDAGuard device_guard(sample.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    dim3 blocks(D);
+    dim3 threads(128);
+
+    hbba_calibrate_cuda_kernel<<<blocks, threads, 0, stream>>>(
+        sample.data_ptr<float>(),
+        centroids.data_ptr<float>(),
+        n_map.data_ptr<int>(),
+        N, D
+    );
+    return centroids;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &fwht_cuda_forward, "KudaHitam Forward FWHT (Orthonormal)");
     m.def("ultra_fused_full_fusion", &ultra_fused_full_fusion_cuda, "KudaHitam God Kernel V8.3 (Complete)");
     m.def("ultra_fused_hbba_fusion", &ultra_fused_hbba_fusion_cuda, "KudaHitam HBBA God Kernel V8.5 (Hybrid 1/4-bit)");
+    m.def("hbba_calibrate_cuda", &hbba_calibrate_cuda, "Atomic HBBA Calibrator (V8.7)");
 }

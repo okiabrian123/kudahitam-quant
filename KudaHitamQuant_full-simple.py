@@ -250,13 +250,12 @@ class KudahitamCompressorHBBA:
         # 1. Variance-based allocation
         variances = sample_rotated.var(0); num_4bit = int(D * self.hbba_4bit_ratio)
         top_indices = torch.topk(variances, num_4bit).indices
+        
         self.n_centroids_map = torch.full((D,), 2, dtype=torch.int32, device=dev); self.n_centroids_map[top_indices] = 16
         
-        # 2. Stateless Min-Max Centroids (Uniform) - Instant & Full GPU
-        min_v = sample_rotated.min(0).values.unsqueeze(1)
-        max_v = sample_rotated.max(0).values.unsqueeze(1)
-        steps = torch.linspace(0, 1, 16, device=dev).unsqueeze(0)
-        self.centroids_table = min_v + steps * (max_v - min_v)
+        # 2. Atomic CUDA Calibrator (Lloyd-Max in GPU SRAM) - V8.7
+        cuda_ext = load_cuda_ext()
+        self.centroids_table = cuda_ext.hbba_calibrate_cuda(sample_rotated.float().contiguous(), self.n_centroids_map.contiguous())
         self.is_calibrated = True
 
     @torch.no_grad()
