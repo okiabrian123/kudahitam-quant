@@ -82,8 +82,8 @@ def load_cuda_ext():
         os.makedirs(build_dir, exist_ok=True)
         
         try:
-            print(f"[KudaHitam] Starting JIT Compilation (Mode: Gila Mode V7.6 FP16 Native Engine)...")
-            _KudaHitamCUDA = load(name="KudaHitamCUDA_V76", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir)
+            print(f"[KudaHitam] Starting JIT Compilation (Mode: Gila Mode V7.6.2 FP16 Native)...")
+            _KudaHitamCUDA = load(name="KudaHitamCUDA_V762", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir)
             CUDA_EXT_AVAILABLE = True
             print("[KudaHitam] [✓] ULTRA-GILA MODE ACTIVE: Monolithic Native FP16 (V7.6) fully loaded.")
         except Exception as e:

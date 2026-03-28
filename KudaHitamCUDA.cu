@@ -43,8 +43,8 @@ __device__ __forceinline__ void fwht_butterfly_warp(float r[8], int lane_id) {
 
 __global__ void ultra_fused_full_fusion_kernel_fp16(
     const half* __restrict__ x, 
-    const float* __restrict__ d, 
-    const float* __restrict__ centroids, 
+    const half* __restrict__ d, 
+    const half* __restrict__ centroids, 
     uint8_t* __restrict__ out_idx, 
     float* __restrict__ out_norms, 
     half* __restrict__ out_kmse,
@@ -58,7 +58,6 @@ __global__ void ultra_fused_full_fusion_kernel_fp16(
     float sum_sq = 0.0f;
     
     // 1. Vectorized FP16 Load & Cast to Float in Registers
-    // Each thread loads 8 halfs (2 float4 equivalent in terms of elements, but half size)
     const half2* x_ptr = reinterpret_cast<const half2*>(x) + global_warp_id * 128 + lane_id * 4;
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -73,12 +72,12 @@ __global__ void ultra_fused_full_fusion_kernel_fp16(
     if (lane_id == 0) out_norms[global_warp_id] = norm;
     
     // 2. Scale by d and norm
-    float4 d_vec0 = reinterpret_cast<const float4*>(d)[lane_id];
-    float4 d_vec1 = reinterpret_cast<const float4*>(d)[lane_id + 32];
-    r[0] = (r[0] * d_vec0.x) / norm; r[1] = (r[1] * d_vec0.y) / norm; 
-    r[2] = (r[2] * d_vec0.z) / norm; r[3] = (r[3] * d_vec0.w) / norm;
-    r[4] = (r[4] * d_vec1.x) / norm; r[5] = (r[5] * d_vec1.y) / norm; 
-    r[6] = (r[6] * d_vec1.z) / norm; r[7] = (r[7] * d_vec1.w) / norm;
+    // Load d as half and cast to float
+    const half* d_local = d + lane_id * 8; 
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        r[i] = (r[i] * __half2float(d_local[i])) / norm;
+    }
 
     fwht_butterfly_warp(r, lane_id);
     
@@ -89,11 +88,11 @@ __global__ void ultra_fused_full_fusion_kernel_fp16(
         float projected = r[k] * f_scale;
         uint8_t best_c = 0; float min_dist = 1e18f;
         for(int c = 0; c < n_centroids; ++c) {
-            float dist = fabsf(projected - centroids[c]);
+            float dist = fabsf(projected - __half2float(centroids[c]));
             if (dist < min_dist) { min_dist = dist; best_c = (uint8_t)c; }
         }
         out_c[k] = best_c;
-        r[k] = centroids[best_c]; 
+        r[k] = __half2float(centroids[best_c]); 
     }
     
     if (out_idx != nullptr) {
@@ -113,14 +112,8 @@ __global__ void ultra_fused_full_fusion_kernel_fp16(
     half2* out_ptr = reinterpret_cast<half2*>(out_kmse) + global_warp_id * 128 + lane_id * 4;
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        float d_val0, d_val1;
-        if (i == 0) { d_val0 = d_vec0.x; d_val1 = d_vec0.y; }
-        else if (i == 1) { d_val0 = d_vec0.z; d_val1 = d_vec0.w; }
-        else if (i == 2) { d_val0 = d_vec1.x; d_val1 = d_vec1.y; }
-        else { d_val0 = d_vec1.z; d_val1 = d_vec1.w; }
-        
-        float res0 = r[i*2] * m_base * d_val0;
-        float res1 = r[i*2+1] * m_base * d_val1;
+        float res0 = r[i*2] * m_base;
+        float res1 = r[i*2+1] * m_base;
         out_ptr[i] = __floats2half2_rn(res0, res1);
     }
 }
@@ -147,8 +140,8 @@ std::vector<torch::Tensor> ultra_fused_full_fusion_cuda(
 
     ultra_fused_full_fusion_kernel_fp16<<<blocks, threads, 0, stream>>>(
         (const half*)x.data_ptr<at::Half>(), 
-        d.data_ptr<float>(), 
-        centroids.data_ptr<float>(), 
+        (const half*)d.data_ptr<at::Half>(), 
+        (const half*)centroids.data_ptr<at::Half>(), 
         out_idx.data_ptr<uint8_t>(), 
         out_norms.data_ptr<float>(), 
         (half*)out_kmse.data_ptr<at::Half>(),
