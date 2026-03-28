@@ -82,7 +82,7 @@ __global__ void ultra_fused_full_fusion_kernel_fp16(
 
     fwht_butterfly_warp(r, lane_id);
     
-    float f_scale = 1.0f / 16.0f; 
+    float f_scale = 1.0f / sqrtf((float)D); 
     uint8_t out_c[8];
     #pragma unroll
     for(int k = 0; k < 8; ++k) {
@@ -106,7 +106,7 @@ __global__ void ultra_fused_full_fusion_kernel_fp16(
 
     fwht_butterfly_warp(r, lane_id);
     
-    float b_scale = 1.0f / 16.0f; 
+    float b_scale = 1.0f / sqrtf((float)D); 
     float m_base = b_scale * norm;
     
     // Final Scale & Write as FP16
