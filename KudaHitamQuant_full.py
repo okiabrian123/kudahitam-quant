@@ -462,9 +462,9 @@ class KudahitamCompressorHBBA:
         cuda_ext = load_cuda_ext()
         
         if not self.is_calibrated:
-            # Quick forward for calibration
+            # Quick forward for calibration (Orthonormal Scaling Fix)
             norm = torch.norm(flat, dim=-1, keepdim=True)
-            rotated = fwht((flat.float() / (norm+1e-8)) * self.d.to(dev))
+            rotated = fwht((flat.float() / (norm+1e-8)) * self.d.to(dev)) / math.sqrt(self.head_dim)
             self._calibrate_hbba(rotated[:1024])
 
         indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(

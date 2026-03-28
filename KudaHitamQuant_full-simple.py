@@ -267,7 +267,8 @@ class KudahitamCompressorHBBA:
         dev = states.device; shape = states.shape; flat = states.reshape(-1, shape[-1]).half()
         cuda_ext = load_cuda_ext()
         if not self.is_calibrated:
-            norm = torch.norm(flat, dim=-1, keepdim=True); rotated = fwht((flat.float() / (norm+1e-8)) * self.d.to(dev)); self._calibrate_hbba(rotated[:1024])
+            # Quick forward for calibration (Orthonormal Scaling Fix)
+            norm = torch.norm(flat, dim=-1, keepdim=True); rotated = fwht((flat.float() / (norm+1e-8)) * self.d.to(dev)) / math.sqrt(self.head_dim); self._calibrate_hbba(rotated[:1024])
         indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.n_centroids_map)
         return { "indices": indices, "norms": vec_norms.squeeze(-1), "k_mse": k_mse.view(shape), "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]), "signs": signs.view(shape), "shape": tuple(shape) }
 
