@@ -498,7 +498,7 @@ MODEL_NAME = "Qwen/Qwen3.5-2B"
 
 def main():
     print("=" * 150); print(f"      KUDAHITAM-QUANT: PURE TRITON MULTI-PASS BENCHMARK (STABLE)"); print("=" * 150)
-    if not hasattr(main, 'all_results'): main.all_results = []
+    all_results = []
     
     print("Pre-compiling KudaHitam CUDA JIT Extension...")
     load_cuda_ext()
@@ -616,13 +616,13 @@ def main():
                         torch.cuda.synchronize(); t0 = time.perf_counter(); c = comp.compress(keys, offload=False); torch.cuda.synchronize(); comp_l.append(time.perf_counter() - t0); s = comp.asymmetric_attention_scores(q, c); cos_l.append(F.cosine_similarity(real.flatten(), s.flatten(), dim=0))
                     res_row[ver] = {"acc": (torch.stack(cos_l).mean().item()), "ms": (sum(comp_l)/len(comp_l))*1000}
                 print(f"Done: {ctx} | {task_name} | {s_name}")
-                main.all_results.append((ctx, task_name, s_name, res_row['V2']['acc'], res_row['Gaussian']['acc'], res_row['V2']['ms'], res_row['Gaussian']['ms'], mem_total))
+                all_results.append((ctx, task_name, s_name, res_row['V2']['acc'], res_row['Gaussian']['acc'], res_row['V2']['ms'], res_row['Gaussian']['ms'], mem_total))
 
     # --- FINAL CONSOLIDATED DISPLAY ---
     print("\n" + "=" * 165)
     print(f"{'Ctx':7s} | {'Field':10s} | {'Strategy/Bit Mode':34s} | {'Acc (V2/F)':12s} | {'Acc (G)':12s} | {'Comp(V2)':8s} | {'Comp(G)':8s} | {'Mem'}")
     print("-" * 165)
-    for r in main.all_results:
+    for r in all_results:
         print(f"{r[0]:5d} | {r[1]:10s} | {r[2]:34s} | {r[3]:.4f}     | {r[4]:.4f}     | {r[5]:8.2f} | {r[6]:8.2f} | {int(r[7]):7d}")
     print("=" * 165)
 if __name__ == "__main__":
