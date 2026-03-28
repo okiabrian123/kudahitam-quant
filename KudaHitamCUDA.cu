@@ -283,7 +283,7 @@ __global__ void ultra_fused_hbba_fusion_kernel(
     const half* __restrict__ x, 
     const float* __restrict__ d, 
     const float* __restrict__ centroids_table, // [D, 16]
-    const int* __restrict__ n_centroids_map,   // [D]
+    const uint32_t* __restrict__ hbba_mask,    // [8] (256 bits)
     uint8_t* __restrict__ out_idx, 
     float* __restrict__ out_norms, 
     float* __restrict__ out_kmse,
@@ -351,14 +351,10 @@ __global__ void ultra_fused_hbba_fusion_kernel(
     }
 
     __shared__ half s_centroids[256][16];
-    __shared__ int s_n_c[256];
 
     // Parallel load centroids to SRAM
     for (int i = threadIdx.x; i < D * 16; i += threads_per_row) {
         s_centroids[i / 16][i % 16] = __float2half(centroids_table[i]);
-    }
-    for (int i = threadIdx.x; i < D; i += threads_per_row) {
-        s_n_c[i] = n_centroids_map[i];
     }
     __syncthreads();
 
@@ -367,7 +363,9 @@ __global__ void ultra_fused_hbba_fusion_kernel(
     #pragma unroll
     for(int k = 0; k < 8; ++k) {
         int element_idx = lane_in_row * 8 + k;
-        int n_centroids = s_n_c[element_idx];
+        // Bit-Mask Lookup (0=1bit, 1=4bit)
+        int is_4bit = (hbba_mask[element_idx >> 5] >> (element_idx & 31)) & 1;
+        int n_centroids = is_4bit ? 16 : 2;
         
         float projected = r[k] * f_scale;
         uint8_t best_c = 0; float min_dist = 1e18f;
@@ -591,18 +589,15 @@ torch::Tensor hbba_calibrate_cuda(torch::Tensor sample, torch::Tensor n_map) {
     return centroids;
 }
 
-// --- Symmetry Nexus (V8.8) Component ---
+// --- Symmetry Nexus (V8.8.2) Component ---
 
-// Fast Bit-Mask Lookup
-__device__ __forceinline__ int get_hbba_bit(const uint32_t* mask, int i) {
-    return (mask[i >> 5] >> (i & 31)) & 1;
-}
-
-// Intra-warp rank calculation (inclusive)
-__device__ __forceinline__ int get_rank(const uint32_t* mask, int i, int bit_val) {
-    int rank = 0;
-    for(int d = 0; d < i; ++d) {
-        if(get_hbba_bit(mask, d) == bit_val) rank++;
+// Fast Rank Calculation using __popc
+__device__ __forceinline__ int get_rank_v2(const uint32_t* mask, int i, int bit_val) {
+    int idx = i >> 5; int pos = i & 31; int rank = 0;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (j < idx) rank += __popc(bit_val ? mask[j] : ~mask[j]);
+        else if (j == idx) rank += __popc((bit_val ? mask[j] : ~mask[j]) & ((1U << pos) - 1));
     }
     return rank;
 }
@@ -624,34 +619,27 @@ __global__ void packed_hbba_fusion_kernel(
 
     __shared__ float s_row[256];
     __shared__ half s_centroids[256][16];
-    __shared__ uint8_t s_packed[56];
+    __shared__ uint8_t s_p[56];
     
-    // 1. Parallel Load and FWHT (Same as God Kernel)
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        s_row[i] = __half2float(x[row * D + i]) * d_vec[i];
-    }
+    // 1. Parallel Load and FWHT
+    for (int i = threadIdx.x; i < D; i += blockDim.x) s_row[i] = __half2float(x[row * D + i]) * d_vec[i];
+    if (threadIdx.x < 56) s_p[threadIdx.x] = 0;
     __syncthreads();
 
-    // In-place FWHT (Iterative)
+    // In-place FWHT
     for (int len = 1; len < D; len <<= 1) {
-        for (int i = threadIdx.x; i < D; i += (blockDim.x)) {
+        for (int i = threadIdx.x; i < D; i += blockDim.x) {
             int step = i / len;
             if (step % 2 == 0) {
-                int a_idx = i; int b_idx = i + len;
-                float a = s_row[a_idx]; float b = s_row[b_idx];
-                s_row[a_idx] = a + b; s_row[b_idx] = a - b;
+                float a = s_row[i]; float b = s_row[i + len];
+                s_row[i] = a + b; s_row[i + len] = a - b;
             }
         }
         __syncthreads();
     }
 
     // 2. Load Centroids to SRAM
-    for (int i = threadIdx.x; i < D * 16; i += blockDim.x) {
-        s_centroids[i / 16][i % 16] = __float2half(centroids_table[i]);
-    }
-    if (threadIdx.x == 0) {
-        for(int j=0; j<56; ++j) s_packed[j] = 0;
-    }
+    for (int i = threadIdx.x; i < D * 16; i += blockDim.x) s_centroids[i / 16][i % 16] = __float2half(centroids_table[i]);
     __syncthreads();
 
     float norm_val = 0;
@@ -662,7 +650,7 @@ __global__ void packed_hbba_fusion_kernel(
     float kmse = 0;
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         float val = s_row[i] * inv_norm;
-        int is_4bit = get_hbba_bit(hbba_mask, i);
+        int is_4bit = (hbba_mask[i >> 5] >> (i & 31)) & 1;
         int n_c = is_4bit ? 16 : 2;
         
         int best_c = 0; float min_dist = 1e18f;
@@ -671,34 +659,31 @@ __global__ void packed_hbba_fusion_kernel(
             if (dist < min_dist) { min_dist = dist; best_c = c; }
         }
         
-        float rec = __half2float(s_centroids[i][best_c]);
-        float res = val - rec;
+        float res = val - __half2float(s_centroids[i][best_c]);
         out_signs[row * D + i] = __float2half(res);
         kmse += res * res;
 
-        // 3. Bit-Packing (SRAM)
-        int rank = get_rank(hbba_mask, i, is_4bit);
+        // 3. Grouped Bit-Packing (SRAM) - V8.8.2
+        int rank = get_rank_v2(hbba_mask, i, is_4bit);
         if (is_4bit) {
-            // Group A: 4-bit (2 per byte)
+            // Group A (Byte 0-31): 2 per byte
             int byte_idx = rank >> 1;
             int shift = (rank & 1) ? 4 : 0;
-            atomicOr((unsigned int*)&s_packed[byte_idx / 4 * 4], (unsigned int)((best_c & 0xF) << (shift + (byte_idx % 4) * 8)));
+            atomicOr((unsigned int*)&s_p[byte_idx & ~3], (unsigned int)((best_c & 0xF) << (shift + (byte_idx & 3) * 8)));
         } else {
-            // Group B: 1-bit (8 per byte)
+            // Group B (Byte 32-55): 8 per byte
             int byte_idx = 32 + (rank >> 3);
             int shift = rank & 7;
-            atomicOr((unsigned int*)&s_packed[byte_idx / 4 * 4], (unsigned int)((best_c & 0x1) << (shift + (byte_idx % 4) * 8)));
+            atomicOr((unsigned int*)&s_p[byte_idx & ~3], (unsigned int)((best_c & 0x1) << (shift + (byte_idx & 3) * 8)));
         }
     }
 
-    // Reduce KMSE
     for (int offset = 16; offset > 0; offset >>= 1) kmse += __shfl_xor_sync(0xffffffff, kmse, offset);
     
     if (threadIdx.x == 0) {
         out_norms[row] = norm_val;
         out_kmse[row] = kmse / D;
-        // Write packed indices
-        for(int j=0; j<56; ++j) out_packed[row * 56 + j] = s_packed[j];
+        for(int j=0; j<56; ++j) out_packed[row * 56 + j] = s_p[j];
     }
 }
 
@@ -719,8 +704,8 @@ __global__ void asymmetric_score_kernel(
     float norm = k_norms[row];
 
     for (int i = 0; i < D; ++i) {
-        int is_4bit = get_hbba_bit(mask, i);
-        int rank = get_rank(mask, i, is_4bit);
+        int is_4bit = (mask[i >> 5] >> (i & 31)) & 1;
+        int rank = get_rank_v2(mask, i, is_4bit);
         int val = 0;
         if (is_4bit) {
             int byte_idx = rank >> 1;
@@ -734,15 +719,12 @@ __global__ void asymmetric_score_kernel(
     out_scores[row] = score;
 }
 
-// --- Wrappers and Metadata ---
+// --- Wrappers ---
 
 std::vector<torch::Tensor> packed_hbba_fusion_cuda(
     torch::Tensor x, torch::Tensor d_vec, torch::Tensor centroids, torch::Tensor mask) {
-    
-    int N = x.size(0);
-    int D = x.size(1);
+    int N = x.size(0); int D = x.size(1);
     auto options = torch::TensorOptions().device(x.device());
-    
     auto out_packed = torch::zeros({N, 56}, options.dtype(torch::kUInt8));
     auto out_norms = torch::zeros({N}, options.dtype(torch::kFloat32));
     auto out_kmse = torch::zeros({N}, options.dtype(torch::kFloat32));
@@ -750,42 +732,23 @@ std::vector<torch::Tensor> packed_hbba_fusion_cuda(
     auto out_signs = torch::zeros({N, D}, options.dtype(torch::kHalf));
 
     at::cuda::CUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    
-    packed_hbba_fusion_kernel<<<N, 128, 0, stream>>>(
-        (const half*)x.data_ptr<at::Half>(),
-        d_vec.data_ptr<float>(),
-        centroids.data_ptr<float>(),
-        (const uint32_t*)mask.data_ptr<int>(),
-        out_packed.data_ptr<uint8_t>(),
-        out_norms.data_ptr<float>(),
-        out_kmse.data_ptr<float>(),
-        out_r_norms.data_ptr<float>(),
-        (half*)out_signs.data_ptr<at::Half>(),
-        D, N
+    packed_hbba_fusion_kernel<<<N, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        (const half*)x.data_ptr<at::Half>(), d_vec.data_ptr<float>(), centroids.data_ptr<float>(),
+        (const uint32_t*)mask.data_ptr<int>(), out_packed.data_ptr<uint8_t>(),
+        out_norms.data_ptr<float>(), out_kmse.data_ptr<float>(), out_r_norms.data_ptr<float>(), (half*)out_signs.data_ptr<at::Half>(), D, N
     );
     return {out_packed, out_norms, out_kmse, out_r_norms, out_signs};
 }
 
 torch::Tensor asymmetric_score_cuda(
     torch::Tensor q, torch::Tensor k_packed, torch::Tensor k_norms, torch::Tensor mask, torch::Tensor centroids) {
-    
-    int N = k_packed.size(0);
-    int D = q.size(0);
+    int N = k_packed.size(0); int D = q.size(0);
     auto out_scores = torch::zeros({N}, torch::TensorOptions().dtype(torch::kFloat32).device(q.device()));
-
     at::cuda::CUDAGuard device_guard(q.device());
-    int threads = 256;
-    int blocks = (N + threads - 1) / threads;
-    
+    int threads = 256; int blocks = (N + threads - 1) / threads;
     asymmetric_score_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (const half*)q.data_ptr<at::Half>(),
-        k_packed.data_ptr<uint8_t>(),
-        k_norms.data_ptr<float>(),
-        (const uint32_t*)mask.data_ptr<int>(),
-        centroids.data_ptr<float>(),
-        out_scores.data_ptr<float>(),
-        D, N
+        (const half*)q.data_ptr<at::Half>(), k_packed.data_ptr<uint8_t>(), k_norms.data_ptr<float>(),
+        (const uint32_t*)mask.data_ptr<int>(), centroids.data_ptr<float>(), out_scores.data_ptr<float>(), D, N
     );
     return out_scores;
 }
