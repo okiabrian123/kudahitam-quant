@@ -204,19 +204,41 @@ if TRITON_AVAILABLE:
 # --- WRAPPER FUNCTIONS ---
 
 def fwht(x: torch.Tensor):
-    if not x.is_cuda: return fwht_pytorch(x)
+    if not x.is_cuda:
+        if not hasattr(fwht, '_notified'):
+            print("[KudaHitam] [!] FWHT: Input not on CUDA. Using PyTorch fallback.")
+            fwht._notified = True
+        return fwht_pytorch(x)
+        
     cuda_ext = load_cuda_ext()
     if CUDA_EXT_AVAILABLE and cuda_ext:
+        if not hasattr(fwht, '_notified'):
+            print("[KudaHitam] [✓] FWHT: Using Hardware-Optimized CUDA Kernel.")
+            fwht._notified = True
         orig_shape = x.shape
         x = x.reshape(-1, x.shape[-1]).contiguous()
         cuda_ext.forward(x)
         return x.reshape(orig_shape)
         
     # Priority 2: Bitwise-Optimized Triton (Blocked)
-    if not TRITON_AVAILABLE: return fwht_pytorch(x)
+    if not TRITON_AVAILABLE:
+        if not hasattr(fwht, '_notified'):
+            print("[KudaHitam] [!] FWHT: CUDA Extension & Triton unavailable. Using PyTorch fallback.")
+            fwht._notified = True
+        return fwht_pytorch(x)
+        
     orig_shape = x.shape
     x = x.reshape(-1, x.shape[-1]).contiguous(); D = x.shape[-1]
-    if (D & (D - 1)) != 0: return fwht_pytorch(x)
+    if (D & (D - 1)) != 0:
+        if not hasattr(fwht, '_notified'):
+            print(f"[KudaHitam] [!] FWHT: D={D} is not power-of-2. Using PyTorch fallback.")
+            fwht._notified = True
+        return fwht_pytorch(x)
+        
+    if not hasattr(fwht, '_notified'):
+        print("[KudaHitam] [✓] FWHT: Using Bitwise-Optimized Triton Kernel.")
+        fwht._notified = True
+        
     y = torch.empty_like(x)
     with torch.cuda.device(x.device):
         BLOCK_ROWS = 64
