@@ -400,6 +400,10 @@ MODEL_NAME = "Qwen/Qwen3.5-2B"
 
 def main():
     print("=" * 150); print(f"      KUDAHITAM-QUANT: PURE TRITON MULTI-PASS BENCHMARK (STABLE)"); print("=" * 150)
+    
+    print("Pre-compiling KudaHitam CUDA JIT Extension...")
+    load_cuda_ext()
+    
     tok = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     # Use bnb with compute_dtype and safe loading
     try:
