@@ -54,75 +54,99 @@ __global__ void ultra_fused_compress_kernel(
     float* __restrict__ out_norms, 
     int D, int N, int n_centroids) 
 {
-    int row_idx = blockIdx.x;
-    if (row_idx >= N) return;
-    int tid = threadIdx.x;
+    int global_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (global_warp_id >= N) return;
+    int lane_id = threadIdx.x & 31;
     
-    __shared__ float sdata[1024]; 
+    float r[8];
+    float sum_sq = 0.0f;
     
-    // 1. Load, Scale by d, and compute partial sum of squares
-    float x_val = x[row_idx * D + tid];
-    float d_val = d[tid];
-    float sq = x_val * x_val;
-    
-    // Warp-level reduction for sum of squares
-    float sum_sq = warp_reduce_sum(sq);
-    
-    // Block-level reduction (shared memory)
-    if ((tid & 31) == 0) sdata[tid >> 5] = sum_sq;
-    __syncthreads();
-    
-    if (tid < 32) {
-        sum_sq = (tid < (D >> 5)) ? sdata[tid] : 0.0f;
-        sum_sq = warp_reduce_sum(sum_sq);
-        if (tid == 0) sdata[0] = sqrtf(sum_sq + 1e-8f); // This is the L2 norm
-    }
-    __syncthreads();
-    
-    float norm = sdata[0];
-    if (tid == 0) out_norms[row_idx] = norm;
-    
-    // 2. Prepare for FWHT: (x * d) / norm
-    float val = (x_val * d_val) / norm;
-    
-    // 3. FWHT (Gila Mode)
-    fwht_warp(val, 16);
-    sdata[tid] = val; __syncthreads();
-    
-    for (int step = 32; step < D; step <<= 1) {
-        float other = sdata[tid ^ step];
-        if ((tid & step) == 0) val = val + other;
-        else val = other - val;
-        __syncthreads();
-        sdata[tid] = val; __syncthreads();
-    }
-    
-    // 4. Orthonormal scaling + Argmin
-    float projected = val * (1.0f / sqrtf((float)D));
-    
-    float min_dist = 1e18f;
-    uint8_t best_idx = 0;
+    // Vectorized Load (float4) & Partial Norm
+    float4 load0 = reinterpret_cast<const float4*>(x)[global_warp_id * 64 + lane_id];
+    float4 load1 = reinterpret_cast<const float4*>(x)[global_warp_id * 64 + lane_id + 32];
+    r[0] = load0.x; r[1] = load0.y; r[2] = load0.z; r[3] = load0.w;
+    r[4] = load1.x; r[5] = load1.y; r[6] = load1.z; r[7] = load1.w;
+
     #pragma unroll
-    for (int i = 0; i < n_centroids; ++i) {
-        float dist = fabsf(projected - centroids[i]);
-        if (dist < min_dist) {
-            min_dist = dist;
-            best_idx = (uint8_t)i;
+    for(int k=0; k<8; ++k) sum_sq += r[k]*r[k];
+    
+    // Warp-level reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+    
+    float norm = __shfl_sync(0xffffffff, sum_sq > 0 ? sqrtf(sum_sq) : 1e-8f, 0);
+    if (lane_id == 0) out_norms[global_warp_id] = norm;
+    
+    // Scale by d and norm
+    float4 d0 = reinterpret_cast<const float4*>(d)[lane_id];
+    float4 d1 = reinterpret_cast<const float4*>(d)[lane_id + 32];
+    
+    r[0] = (r[0] * d0.x) / norm; r[1] = (r[1] * d0.y) / norm; 
+    r[2] = (r[2] * d0.z) / norm; r[3] = (r[3] * d0.w) / norm;
+    r[4] = (r[4] * d1.x) / norm; r[5] = (r[5] * d1.y) / norm; 
+    r[6] = (r[6] * d1.z) / norm; r[7] = (r[7] * d1.w) / norm;
+    
+    // Intra-thread FWHT (Steps 1, 2)
+    #pragma unroll
+    for(int step = 1; step <= 2; step <<= 1) {
+        #pragma unroll
+        for(int i = 0; i <= 4; i += 4) {
+            #pragma unroll
+            for(int j = 0; j < 4; ++j) {
+                if ((j & step) == 0) {
+                    float a = r[i + j];
+                    float b = r[i + (j | step)];
+                    r[i + j] = a + b;
+                    r[i + (j | step)] = a - b;
+                }
+            }
         }
     }
     
-    // 5. Final Store
-    out_idx[row_idx * D + tid] = best_idx;
-}
-
-void fwht_cuda_forward(torch::Tensor x) {
-    const int N = x.size(0);
-    const int D = x.size(1);
-    at::cuda::CUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    dim3 blocks(N);
-    dim3 threads(D);
-    fwht_kernel_legacy<<<blocks, threads, 0, stream>>>(x.data_ptr<float>(), D, N);
+    // Inter-thread FWHT (Steps 4, 8, 16, 32, 64) -> t_step = 1, 2, 4, 8, 16 
+    #pragma unroll
+    for(int t_step = 1; t_step <= 16; t_step <<= 1) {
+        #pragma unroll
+        for(int k = 0; k < 8; ++k) {
+            float other = __shfl_xor_sync(0xffffffff, r[k], t_step);
+            if ((lane_id & t_step) == 0) r[k] = r[k] + other;
+            else r[k] = other - r[k];
+        }
+    }
+    
+    // Intra-thread FWHT (Step 128)
+    #pragma unroll
+    for(int j = 0; j < 4; ++j) {
+        float a = r[j];
+        float b = r[j + 4];
+        r[j] = a + b;
+        r[j + 4] = a - b;
+    }
+    
+    // Quantization
+    float scale = 1.0f / 16.0f;
+    uint8_t out_c[8];
+    #pragma unroll
+    for(int k = 0; k < 8; ++k) {
+        float projected = r[k] * scale;
+        uint8_t best_c = 0;
+        float min_dist = 1e18f;
+        for(int c = 0; c < n_centroids; ++c) {
+            float dist = fabsf(projected - centroids[c]);
+            if (dist < min_dist) { min_dist = dist; best_c = (uint8_t)c; }
+        }
+        out_c[k] = best_c;
+    }
+    
+    // Vectorized Write
+    union { uint8_t b[4]; uint32_t v; } pack0, pack1;
+    pack0.b[0] = out_c[0]; pack0.b[1] = out_c[1]; pack0.b[2] = out_c[2]; pack0.b[3] = out_c[3];
+    pack1.b[0] = out_c[4]; pack1.b[1] = out_c[5]; pack1.b[2] = out_c[6]; pack1.b[3] = out_c[7];
+    
+    reinterpret_cast<uint32_t*>(out_idx)[global_warp_id * 64 + lane_id] = pack0.v;
+    reinterpret_cast<uint32_t*>(out_idx)[global_warp_id * 64 + lane_id + 32] = pack1.v;
 }
 
 std::vector<torch::Tensor> ultra_fused_compress_cuda(
@@ -130,6 +154,7 @@ std::vector<torch::Tensor> ultra_fused_compress_cuda(
 {
     const int N = x.size(0);
     const int D = x.size(1);
+    if (D != 256) throw std::runtime_error("Warp-Only FWHT requires D=256");
     const int n_centroids = centroids.size(0);
     auto idx_options = torch::TensorOptions().dtype(torch::kUInt8).device(x.device());
     auto norm_options = torch::TensorOptions().dtype(torch::kFloat32).device(x.device());
@@ -137,8 +162,8 @@ std::vector<torch::Tensor> ultra_fused_compress_cuda(
     torch::Tensor out_norms = torch::empty({N, 1}, norm_options);
     at::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    dim3 blocks(N);
-    dim3 threads(D);
+    dim3 threads(256);
+    dim3 blocks((N + 7) / 8);
     ultra_fused_compress_kernel<<<blocks, threads, 0, stream>>>(
         x.data_ptr<float>(), d.data_ptr<float>(), centroids.data_ptr<float>(), 
         out_idx.data_ptr<uint8_t>(), out_norms.data_ptr<float>(), 
@@ -155,34 +180,75 @@ __global__ void ultra_fused_reconstruct_kernel(
     float* __restrict__ out_kmse,
     int D, int N)
 {
-    int row_idx = blockIdx.x;
-    if (row_idx >= N) return;
-    int tid = threadIdx.x;
+    int global_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (global_warp_id >= N) return;
+    int lane_id = threadIdx.x & 31;
     
-    __shared__ float sdata[1024];
+    union { uint8_t b[4]; uint32_t v; } pack0, pack1;
+    pack0.v = reinterpret_cast<const uint32_t*>(indices)[global_warp_id * 64 + lane_id];
+    pack1.v = reinterpret_cast<const uint32_t*>(indices)[global_warp_id * 64 + lane_id + 32];
     
-    // 1. Dequantize
-    uint8_t idx = indices[row_idx * D + tid];
-    float val = centroids[idx];
-    
-    // 2. FWHT
-    fwht_warp(val, 16);
-    sdata[tid] = val; __syncthreads();
-    
-    for (int step = 32; step < D; step <<= 1) {
-        float other = sdata[tid ^ step];
-        if ((tid & step) == 0) val = val + other;
-        else val = other - val;
-        __syncthreads();
-        sdata[tid] = val; __syncthreads();
+    float r[8];
+    r[0] = centroids[pack0.b[0]]; r[1] = centroids[pack0.b[1]]; 
+    r[2] = centroids[pack0.b[2]]; r[3] = centroids[pack0.b[3]];
+    r[4] = centroids[pack1.b[0]]; r[5] = centroids[pack1.b[1]]; 
+    r[6] = centroids[pack1.b[2]]; r[7] = centroids[pack1.b[3]];
+
+    // Step 1, 2
+    #pragma unroll
+    for(int step = 1; step <= 2; step <<= 1) {
+        #pragma unroll
+        for(int i = 0; i <= 4; i += 4) {
+            #pragma unroll
+            for(int j = 0; j < 4; ++j) {
+                if ((j & step) == 0) {
+                    float a = r[i + j];
+                    float b = r[i + (j | step)];
+                    r[i + j] = a + b;
+                    r[i + (j | step)] = a - b;
+                }
+            }
+        }
     }
     
-    // 3. Orthonormal scaling, un-rademacher (d), and multiply by norm
-    float scale = 1.0f / sqrtf((float)D);
-    float d_val = d[tid];
-    float norm = vec_norms[row_idx];
+    // Step 4..64
+    #pragma unroll
+    for(int t_step = 1; t_step <= 16; t_step <<= 1) {
+        #pragma unroll
+        for(int k = 0; k < 8; ++k) {
+            float other = __shfl_xor_sync(0xffffffff, r[k], t_step);
+            if ((lane_id & t_step) == 0) r[k] = r[k] + other;
+            else r[k] = other - r[k];
+        }
+    }
     
-    out_kmse[row_idx * D + tid] = val * scale * d_val * norm;
+    // Step 128
+    #pragma unroll
+    for(int j = 0; j < 4; ++j) {
+        float a = r[j];
+        float b = r[j + 4];
+        r[j] = a + b;
+        r[j + 4] = a - b;
+    }
+    
+    float scale = 1.0f / 16.0f;
+    float norm = vec_norms[global_warp_id];
+    float4 d0 = reinterpret_cast<const float4*>(d)[lane_id];
+    float4 d1 = reinterpret_cast<const float4*>(d)[lane_id + 32];
+    
+    float m0 = scale * norm * d0.x; float m1 = scale * norm * d0.y;
+    float m2 = scale * norm * d0.z; float m3 = scale * norm * d0.w;
+    float m4 = scale * norm * d1.x; float m5 = scale * norm * d1.y;
+    float m6 = scale * norm * d1.z; float m7 = scale * norm * d1.w;
+    
+    r[0] *= m0; r[1] *= m1; r[2] *= m2; r[3] *= m3;
+    r[4] *= m4; r[5] *= m5; r[6] *= m6; r[7] *= m7;
+    
+    // Vectorized Write
+    float4 out0 = {r[0], r[1], r[2], r[3]};
+    float4 out1 = {r[4], r[5], r[6], r[7]};
+    reinterpret_cast<float4*>(out_kmse)[global_warp_id * 64 + lane_id] = out0;
+    reinterpret_cast<float4*>(out_kmse)[global_warp_id * 64 + lane_id + 32] = out1;
 }
 
 torch::Tensor ultra_fused_reconstruct_cuda(
@@ -190,12 +256,13 @@ torch::Tensor ultra_fused_reconstruct_cuda(
 {
     const int N = indices.size(0);
     const int D = indices.size(1);
+    if (D != 256) throw std::runtime_error("Warp-Only FWHT requires D=256");
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(indices.device());
     torch::Tensor out_kmse = torch::empty({N, D}, options);
     at::cuda::CUDAGuard device_guard(indices.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    dim3 blocks(N);
-    dim3 threads(D);
+    dim3 threads(256);
+    dim3 blocks((N + 7) / 8);
     ultra_fused_reconstruct_kernel<<<blocks, threads, 0, stream>>>(
         indices.data_ptr<uint8_t>(), vec_norms.data_ptr<float>(), 
         centroids.data_ptr<float>(), d.data_ptr<float>(), 
