@@ -377,7 +377,7 @@ class KudahitamCompressorV2:
             
         if self.use_vwh: k_mse = k_mse / self.vwh_weights
         residual = flat_q - k_mse; r_norm = torch.norm(residual, dim=-1); projected = fwht(residual * self.d); signs = (projected >= 0).to(torch.int8) * 2 - 1
-        return { "indices": indices, "norms": vec_norms.squeeze(-1).half(), "p_indices": p_indices, "p_norms": p_norms.squeeze(-1).half() if p_norms is not None else None, "p_idx": self.protected_indices, "rank": len(shape), "shape": tuple(shape), "r_norm": r_norm.half().reshape(shape[:-1]), "k_mse": k_mse.reshape(shape), "signs": signs.reshape(shape), "is_domain": self.is_domain_layer }
+        return { "indices": indices, "norms": vec_norms.squeeze(-1).float(), "p_indices": p_indices, "p_norms": p_norms.squeeze(-1).float() if p_norms is not None else None, "p_idx": self.protected_indices, "rank": len(shape), "shape": tuple(shape), "r_norm": r_norm.float().reshape(shape[:-1]), "k_mse": k_mse.reshape(shape), "signs": signs.reshape(shape), "is_domain": self.is_domain_layer }
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:

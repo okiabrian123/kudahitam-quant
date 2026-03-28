@@ -231,7 +231,7 @@ class KudahitamCompressorV2:
             k_mse = fwht(self.centroids.to(dev)[indices.long()]) * self.d * vec_norms
             
         residual = flat - k_mse; r_norm = torch.norm(residual, dim=-1); projected = fwht(residual * self.d); signs = (projected >= 0).to(torch.int8) * 2 - 1
-        return { "indices": indices, "norms": vec_norms.squeeze(-1).half(), "rank": len(shape), "shape": tuple(shape), "r_norm": r_norm.half().reshape(shape[:-1]), "k_mse": k_mse.reshape(shape), "signs": signs.reshape(shape) }
+        return { "indices": indices, "norms": vec_norms.squeeze(-1).float(), "rank": len(shape), "shape": tuple(shape), "r_norm": r_norm.float().reshape(shape[:-1]), "k_mse": k_mse.reshape(shape), "signs": signs.reshape(shape) }
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:
