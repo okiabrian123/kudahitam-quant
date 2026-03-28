@@ -47,7 +47,7 @@ __global__ void ultra_fused_full_fusion_kernel_fp16(
     const float* __restrict__ centroids, 
     uint8_t* __restrict__ out_idx, 
     float* __restrict__ out_norms, 
-    half* __restrict__ out_kmse,
+    float* __restrict__ out_kmse,
     int D, int N, int n_centroids) 
 {
     int global_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -109,19 +109,24 @@ __global__ void ultra_fused_full_fusion_kernel_fp16(
     float b_scale = 1.0f / sqrtf((float)D); 
     float m_base = b_scale * norm;
     
-    // Final Scale & Write as FP16
-    half2* out_ptr = reinterpret_cast<half2*>(out_kmse) + global_warp_id * 128 + lane_id * 4;
+    // Final Scale & Write as FP32
+    float* out_ptr = out_kmse + global_warp_id * D + lane_id * (D/32);
+    int elements_per_thread = D / 32;
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        float d_val0, d_val1;
-        if (i == 0) { d_val0 = d_vec0.x; d_val1 = d_vec0.y; }
-        else if (i == 1) { d_val0 = d_vec0.z; d_val1 = d_vec0.w; }
-        else if (i == 2) { d_val0 = d_vec1.x; d_val1 = d_vec1.y; }
-        else { d_val0 = d_vec1.z; d_val1 = d_vec1.w; }
-        
-        float res0 = r[i*2] * m_base * d_val0;
-        float res1 = r[i*2+1] * m_base * d_val1;
-        out_ptr[i] = __floats2half2_rn(res0, res1);
+    for (int i = 0; i < 8; ++i) {
+        if (i < elements_per_thread) {
+            float d_val;
+            if (i == 0) d_val = d_vec0.x;
+            else if (i == 1) d_val = d_vec0.y;
+            else if (i == 2) d_val = d_vec0.z;
+            else if (i == 3) d_val = d_vec0.w;
+            else if (i == 4) d_val = d_vec1.x;
+            else if (i == 5) d_val = d_vec1.y;
+            else if (i == 6) d_val = d_vec1.z;
+            else d_val = d_vec1.w;
+            
+            out_ptr[i] = r[i] * m_base * d_val;
+        }
     }
 }
 
@@ -138,7 +143,7 @@ std::vector<torch::Tensor> ultra_fused_full_fusion_cuda(
 
     torch::Tensor out_idx = torch::empty({N, D}, idx_options);
     torch::Tensor out_norms = torch::empty({N, 1}, norm_options);
-    torch::Tensor out_kmse = torch::empty({N, D}, half_options);
+    torch::Tensor out_kmse = torch::empty({N, D}, norm_options);
 
     at::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -151,7 +156,7 @@ std::vector<torch::Tensor> ultra_fused_full_fusion_cuda(
         centroids.data_ptr<float>(), 
         out_idx.data_ptr<uint8_t>(), 
         out_norms.data_ptr<float>(), 
-        (half*)out_kmse.data_ptr<at::Half>(),
+        out_kmse.data_ptr<float>(),
         D, N, n_centroids
     );
     return {out_idx, out_norms, out_kmse};
