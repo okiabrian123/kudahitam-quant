@@ -351,33 +351,23 @@ class KudahitamCompressorV2:
             else: flat_q[:, self.protected_indices] = 0.0
         else: p_indices = p_norms = None; flat_q = flat
             
-        # Priority: Ultra-Gila Mode (Ultra-Fused: Monolithic V7.5)
+        # V8.0 God Kernel: Fused Indices, Norms, K_MSE, R_Norms, and Signs
         cuda_ext = load_cuda_ext()
-        if CUDA_EXT_AVAILABLE and cuda_ext and flat.is_cuda and not self.use_fractional and not self.use_dynamic_codebook:
-            indices, vec_norms, k_mse = cuda_ext.ultra_fused_full_fusion(flat.contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
-        else:
-            # Fallback to standard Gila Mode or Triton/PyTorch
-            vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)
-            rotated = fwht((flat_q.float() / (vec_norms + 1e-8)) * self.d)
-            if self.use_dynamic_codebook:
-                _a = rotated.abs().mean(); centroids = torch.tensor([-_a, _a], device=dev)
-            else: centroids = self.centroids
-            
-            if self.use_fractional:
-                split_at = 64 if self.use_ultra else 128
-                _sigma = rotated.abs().mean() / 0.79788
-                c_h = 0.9816 * _sigma; c2 = torch.tensor([-c_h, 0.0, c_h], device=dev)
-                idx0 = (rotated[:, :split_at].unsqueeze(-1) - c2).abs().argmin(-1).to(torch.uint8)
-                idx1 = (rotated[:, split_at:].unsqueeze(-1) - centroids).abs().argmin(-1).to(torch.uint8)
-                indices = torch.cat([idx0, idx1], dim=-1)
-                k_mse = fwht(torch.cat([c2[indices[:, :split_at].long()], centroids[indices[:, split_at:].long()]], dim=-1)) * self.d * vec_norms
-            else:
-                indices = (rotated.unsqueeze(-1) - centroids).abs().argmin(-1).to(torch.uint8)
-                k_mse = fwht(centroids[indices.long()]) * self.d * vec_norms
-            
-        if self.use_vwh: k_mse = k_mse / self.vwh_weights
-        residual = flat_q - k_mse; r_norm = torch.norm(residual, dim=-1); projected = fwht(residual * self.d); signs = (projected >= 0).to(torch.int8) * 2 - 1
-        return { "indices": indices, "norms": vec_norms.squeeze(-1).float(), "p_indices": p_indices, "p_norms": p_norms.squeeze(-1).float() if p_norms is not None else None, "p_idx": self.protected_indices, "rank": len(shape), "shape": tuple(shape), "r_norm": r_norm.float().reshape(shape[:-1]), "k_mse": k_mse.reshape(shape), "signs": signs.reshape(shape), "is_domain": self.is_domain_layer }
+        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_full_fusion(flat_q.contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
+        
+        return {
+            "indices": indices,
+            "norms": vec_norms.squeeze(-1),
+            "k_mse": k_mse.view(n_heads, seq_len, head_dim),
+            "r_norm": r_norm.squeeze(-1),
+            "signs": signs.view(n_heads, seq_len, head_dim),
+            "p_indices": p_indices,
+            "p_norms": p_norms.squeeze(-1).float() if p_norms is not None else None,
+            "p_idx": self.protected_indices,
+            "rank": len(shape),
+            "shape": tuple(shape),
+            "is_domain": self.is_domain_layer
+        }
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:
