@@ -437,38 +437,25 @@ class KudahitamCompressorHBBA:
         variances = sample_rotated.var(0); num_4bit = int(D * self.hbba_4bit_ratio)
         top_indices = torch.topk(variances, num_4bit).indices
         
-        self.n_centroids_map = torch.full((D,), 2, dtype=torch.int32, device=dev)
-        self.n_centroids_map[top_indices] = 16
+        self.n_centroids_map = torch.full((D,), 2, dtype=torch.int32, device=dev); self.n_centroids_map[top_indices] = 16
         
-        # 2. Vectorized Lloyd-Max (No Python Loops)
-        min_v = sample_rotated.min(0, keepdim=True).values.T; max_v = sample_rotated.max(0, keepdim=True).values.T
-        c_16 = min_v + torch.linspace(0, 1, 16, device=dev).unsqueeze(0) * (max_v - min_v)
-        c_2  = min_v + torch.linspace(0, 1, 2, device=dev).unsqueeze(0) * (max_v - min_v)
-        
-        c = torch.zeros((D, 16), device=dev, dtype=torch.float32)
-        m_16 = (self.n_centroids_map == 16); m_2 = (self.n_centroids_map == 2)
-        c[m_16, :] = c_16[m_16, :]; c[m_2, :2] = c_2[m_2, :]
-        
-        data = sample_rotated.unsqueeze(2)
-        valid_mask = torch.arange(16, device=dev).unsqueeze(0) < self.n_centroids_map.unsqueeze(1)
-        
-        for _ in range(10):
-            dist = (data - c.unsqueeze(0)).abs()
-            dist = torch.where(valid_mask.unsqueeze(0), dist, torch.tensor(1e9, device=dev, dtype=dist.dtype))
-            idx_onehot = torch.nn.functional.one_hot(dist.argmin(-1), num_classes=16).float()
-            count = idx_onehot.sum(0)
-            c = torch.where(count > 0, (idx_onehot * data).sum(0) / count, c)
-            
-        self.centroids_table = c
+        # 2. Stateless Min-Max Centroids (Uniform) - Instant & Full GPU
+        min_v = sample_rotated.min(0).values.unsqueeze(1)
+        max_v = sample_rotated.max(0).values.unsqueeze(1)
+        steps = torch.linspace(0, 1, 16, device=dev).unsqueeze(0)
+        self.centroids_table = min_v + steps * (max_v - min_v)
         self.is_calibrated = True
 
     @torch.no_grad()
     def calibrate(self, states: torch.Tensor):
         if self.is_calibrated: return
         if isinstance(states, (list, tuple)): states = states[0]
-        dev = states.device; flat = states.reshape(-1, states.shape[-1]).float()[:1024]
+        dev = states.device; S = states.shape[-2]; D = states.shape[-1]
+        # Random Sample 1k (as requested)
+        idx = torch.randperm(S, device=dev)[:1000]
+        flat = states.reshape(-1, D)[idx].float()
         norm = torch.norm(flat, dim=-1, keepdim=True)
-        rotated = fwht((flat / (norm+1e-8)) * self.d.to(dev)) / math.sqrt(self.head_dim)
+        rotated = fwht((flat / (norm+1e-8)) * self.d.to(dev)) / math.sqrt(D)
         self._calibrate_hbba(rotated)
 
     @torch.no_grad()

@@ -434,30 +434,29 @@ class KudahitamCompressorHBBA:
 
     def _calibrate_hbba(self, sample_rotated: torch.Tensor):
         dev = sample_rotated.device; D = self.head_dim
+        # Variance-based allocation
         variances = sample_rotated.var(0); num_4bit = int(D * self.hbba_4bit_ratio)
         top_indices = torch.topk(variances, num_4bit).indices
-        self.n_centroids_map = torch.full((D,), 2, dtype=torch.int32, device=dev)
-        self.n_centroids_map[top_indices] = 16
-        self.centroids_table = torch.zeros((D, 16), device=dev)
-        for i in range(D):
-            n_c = int(self.n_centroids_map[i]); data = sample_rotated[:, i]
-            c = torch.linspace(data.min(), data.max(), n_c, device=dev)
-            for _ in range(10): 
-                dist = (data.unsqueeze(-1) - c).abs()
-                idx = dist.argmin(-1)
-                for k in range(n_c):
-                    mask = (idx == k)
-                    if mask.any(): c[k] = data[mask].mean()
-            self.centroids_table[i, :n_c] = c
+        
+        self.n_centroids_map = torch.full((D,), 2, dtype=torch.int32, device=dev); self.n_centroids_map[top_indices] = 16
+        
+        # 2. Stateless Min-Max Centroids (Uniform Quantization) - Instant & Full GPU
+        min_v = sample_rotated.min(0).values.unsqueeze(1)
+        max_v = sample_rotated.max(0).values.unsqueeze(1)
+        steps = torch.linspace(0, 1, 16, device=dev).unsqueeze(0)
+        self.centroids_table = min_v + steps * (max_v - min_v)
         self.is_calibrated = True
 
     @torch.no_grad()
     def calibrate(self, states: torch.Tensor):
         if self.is_calibrated: return
         if isinstance(states, (list, tuple)): states = states[0]
-        dev = states.device; flat = states.reshape(-1, states.shape[-1]).float()[:1024]
+        dev = states.device; S = states.shape[-2]; D = states.shape[-1]
+        # Random Sample 1k (as requested)
+        idx = torch.randperm(S, device=dev)[:1000]
+        flat = states.reshape(-1, D)[idx].float()
         norm = torch.norm(flat, dim=-1, keepdim=True)
-        rotated = fwht((flat / (norm+1e-8)) * self.d.to(dev)) / math.sqrt(self.head_dim)
+        rotated = fwht((flat / (norm+1e-8)) * self.d.to(dev)) / math.sqrt(D)
         self._calibrate_hbba(rotated)
 
     @torch.no_grad()
