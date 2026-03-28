@@ -426,6 +426,51 @@ class KudahitamCompressorGaussian:
             idx = compressed["p_idx"]; B_idx, Sk_idx = compressed["shape"][0], compressed["shape"][-2]; q_p = queries[..., idx].float(); k_p = compressed["p_vals"].to(dev).float().reshape(B_idx, -1, Sk_idx, len(idx)).squeeze(1); out += torch.matmul(q_p, k_p.transpose(-2, -1))
         return out
 
+class KudahitamCompressorHBBA:
+    def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu", hbba_4bit_ratio: float = 0.25):
+        self.head_dim = head_dim; self.seed = seed; self.device = device; self.hbba_4bit_ratio = hbba_4bit_ratio
+        self.d = (torch.randint(0, 2, (head_dim,), generator=torch.Generator().manual_seed(seed)) * 2 - 1).float().to(device)
+        self.centroids_table = None; self.n_centroids_map = None; self.is_calibrated = False
+
+    def _calibrate_hbba(self, sample_rotated: torch.Tensor):
+        dev = sample_rotated.device; D = self.head_dim
+        variances = sample_rotated.var(0); num_4bit = int(D * self.hbba_4bit_ratio)
+        top_indices = torch.topk(variances, num_4bit).indices
+        self.n_centroids_map = torch.full((D,), 2, dtype=torch.int32, device=dev)
+        self.n_centroids_map[top_indices] = 16
+        self.centroids_table = torch.zeros((D, 16), device=dev)
+        for i in range(D):
+            n_c = int(self.n_centroids_map[i]); data = sample_rotated[:, i]
+            c = torch.linspace(data.min(), data.max(), n_c, device=dev)
+            for _ in range(10): 
+                dist = (data.unsqueeze(-1) - c).abs()
+                idx = dist.argmin(-1)
+                for k in range(n_c):
+                    mask = (idx == k)
+                    if mask.any(): c[k] = data[mask].mean()
+            self.centroids_table[i, :n_c] = c
+        self.is_calibrated = True
+
+    @torch.no_grad()
+    def compress(self, states: torch.Tensor, offload: bool = True) -> dict:
+        if isinstance(states, (list, tuple)): states = states[0]
+        dev = states.device; shape = states.shape; flat = states.reshape(-1, shape[-1])
+        cuda_ext = load_cuda_ext()
+        if not self.is_calibrated:
+            norm = torch.norm(flat, dim=-1, keepdim=True)
+            rotated = fwht((flat.float() / (norm+1e-8)) * self.d.to(dev))
+            self._calibrate_hbba(rotated[:1024])
+        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.n_centroids_map)
+        return { "indices": indices, "norms": vec_norms.squeeze(-1), "k_mse": k_mse.view(shape), "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]), "signs": signs.view(shape), "shape": tuple(shape) }
+
+    @torch.no_grad()
+    def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:
+        dev = queries.device; k_mse = compressed["k_mse"].to(dev).float(); signs = compressed["signs"].to(dev).float(); r_norm = compressed["r_norm"].to(dev).float()
+        term1 = torch.matmul(queries.float(), k_mse.transpose(-2, -1))
+        q_proj = fwht(queries.float() * self.d.to(dev)); qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1))
+        scale = 1.0 / math.sqrt(self.head_dim); out = term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
+        return out
+
 
 # =============================================================================
 # BENCHMARK SUITE (STABLE)
@@ -514,6 +559,7 @@ def main():
             strategies = [
                 ("1-bit Baseline", 1, [], False, 0, 4, []),
                 ("2-bit Baseline", 2, [], False, 0, 4, []),
+                ("HBBA-Hybrid (1/4-bit 25%)", 1.75, [], False, 0, 0, [])
             ]
 
             for s_name, b_count, d_set, use_out, d_p, o_bits, f_set in strategies:
@@ -531,7 +577,11 @@ def main():
                         # Logic: Domain dimensions ONLY for d_set, else 0 outlier for Selective feel.
                         curr_p_dim = d_p if is_d else 0; curr_o_bits = o_bits
                         
-                        if ver == "V2":
+                        if "HBBA" in s_name:
+                            comp = KudahitamCompressorHBBA(D, b_count, seed=l_idx, device=model.device, hbba_4bit_ratio=0.25)
+                            b_eff = 1.75
+                            mem_total += (b_eff * D / 8) * H
+                        elif ver == "V2":
                             curr_use_frac = is_f; curr_use_ultra = (is_f and "Ultra" in s_name)
                             comp = CompClass(D, b_count, seed=l_idx, device=model.device, is_domain_layer=is_d, use_outlier=use_out, domain_p_count=curr_p_dim, p_bits=curr_o_bits, use_spaced=("Spaced" in s_name), use_spectral=("Spectral" in s_name), use_vwh=("VWH" in s_name), use_dynamic_codebook=("Dynamic" in s_name), use_fractional=curr_use_frac, use_ultra=curr_use_ultra)
                             b_eff = 1.25 if curr_use_ultra else (1.5 if curr_use_frac else b_count)
