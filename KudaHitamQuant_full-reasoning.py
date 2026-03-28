@@ -454,7 +454,8 @@ class KudahitamCompressorHBBA:
         idx = torch.randperm(S, device=dev)[:4096]
         flat = states.reshape(-1, D)[idx].float()
         norm = torch.norm(flat, dim=-1, keepdim=True)
-        rotated = fwht((flat / (norm+1e-8)) * self.d.to(dev)) / math.sqrt(D)
+        # Fix: fwht() already applies 1/sqrt(D) normalization in CUDA.
+        rotated = fwht((flat / (norm+1e-8)) * self.d.to(dev))
         self._calibrate_hbba(rotated)
 
     @torch.no_grad()
