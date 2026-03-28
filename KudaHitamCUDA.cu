@@ -116,6 +116,7 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
 
     // 5. Quantize & Sign & Residual Norm Extraction
     float f_scale = 1.0f / 16.0f; // Matching Triton/Baseline Hardcoded Scale
+    float s_factor = (float)D / 256.0f; // Correction for Double-FWHT Scaling in signs
     uint8_t out_c[8];
     float sum_sq_resid = 0.0f;
     #pragma unroll
@@ -127,8 +128,8 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
             if (dist < min_dist) { min_dist = dist; best_c = (uint8_t)c; }
         }
         out_c[k] = best_c;
-        float resid = projected - centroids[best_c];
-        sum_sq_resid += resid * resid;
+        float resid = projected - s_factor * centroids[best_c];
+        sum_sq_resid += (projected - centroids[best_c]) * (projected - centroids[best_c]);
         if (out_signs != nullptr) out_signs[row_id * D + lane_in_row * 8 + k] = (resid >= 0) ? 1 : -1;
         r[k] = centroids[best_c]; 
     }

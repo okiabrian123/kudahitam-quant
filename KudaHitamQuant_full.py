@@ -82,10 +82,10 @@ def load_cuda_ext():
         os.makedirs(build_dir, exist_ok=True)
         
         try:
-            print(f"[KudaHitam] Starting JIT Compilation (Mode: Gila Mode V8.1 Maximum Fusion Engine)...")
-            _KudaHitamCUDA = load(name="KudaHitamCUDA_V81", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir)
+            print(f"[KudaHitam] Starting JIT Compilation (Mode: Gila Mode V8.2 Accuracy Fix)...")
+            _KudaHitamCUDA = load(name="KudaHitamCUDA_V82", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir)
             CUDA_EXT_AVAILABLE = True
-            print("[KudaHitam] [✓] GILA MODE V8.1 ACTIVE: Monolithic Maximum Fusion fully loaded.")
+            print("[KudaHitam] [✓] GILA MODE V8.2 ACTIVE: Monolithic Accuracy Fix fully loaded.")
         except Exception as e:
             print(f"[KudaHitam] [X] JIT Compilation failed! Error detail:\n{str(e)}")
             print("[KudaHitam] Falling back to Triton/PyTorch engine.")
