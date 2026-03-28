@@ -82,10 +82,10 @@ def load_cuda_ext():
         os.makedirs(build_dir, exist_ok=True)
         
         try:
-            print(f"[KudaHitam] Starting JIT Compilation (Mode: Gila Mode V7.5 Full Fusion)...")
-            _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir)
+            print(f"[KudaHitam] Starting JIT Compilation (Mode: Gila Mode V7.6 FP16 Native Engine)...")
+            _KudaHitamCUDA = load(name="KudaHitamCUDA_V76", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir)
             CUDA_EXT_AVAILABLE = True
-            print("[KudaHitam] [✓] ULTRA-GILA MODE ACTIVE: Monolithic Full Fusion (V7.5) fully loaded.")
+            print("[KudaHitam] [✓] ULTRA-GILA MODE ACTIVE: Monolithic Native FP16 (V7.6) fully loaded.")
         except Exception as e:
             print(f"[KudaHitam] [X] JIT Compilation failed! Error detail:\n{str(e)}")
             print("[KudaHitam] Falling back to Triton/PyTorch engine.")
@@ -221,18 +221,17 @@ class KudahitamCompressorV2:
         
         # Priority: Ultra-Gila Mode (Ultra-Fused: Norm + Scale + FWHT + Quant)
         cuda_ext = load_cuda_ext()
-        if CUDA_EXT_AVAILABLE and cuda_ext and states.is_cuda:
-            # Priority: Ultra-Gila Mode (Monolithic V7.5)
+        if CUDA_EXT_AVAILABLE and cuda_ext and flat.is_cuda:
+            # Priority: Ultra-Gila Mode (Monolithic V7.6 Native FP16)
             indices, vec_norms, k_mse = cuda_ext.ultra_fused_full_fusion(flat.contiguous(), self.d.float().contiguous(), self.centroids.to(dev).float().contiguous())
         else:
-            # Fallback to standard Gila Mode or Triton/PyTorch
             vec_norms = torch.norm(flat, dim=-1, keepdim=True)
             rotated = fwht((flat.float() / (vec_norms + 1e-8)) * self.d)
             indices = (rotated.unsqueeze(-1) - self.centroids.to(dev)).abs().argmin(-1).to(torch.uint8)
             k_mse = fwht(self.centroids.to(dev)[indices.long()]) * self.d * vec_norms
             
         residual = flat - k_mse; r_norm = torch.norm(residual, dim=-1); projected = fwht(residual * self.d); signs = (projected >= 0).to(torch.int8) * 2 - 1
-        return { "indices": indices, "norms": vec_norms.squeeze(-1).to(torch.float16), "rank": len(shape), "shape": tuple(shape), "r_norm": r_norm.to(torch.float16).reshape(shape[:-1]), "k_mse": k_mse.to(torch.float16).reshape(shape), "signs": signs.reshape(shape) }
+        return { "indices": indices, "norms": vec_norms.squeeze(-1).half(), "rank": len(shape), "shape": tuple(shape), "r_norm": r_norm.half().reshape(shape[:-1]), "k_mse": k_mse.reshape(shape), "signs": signs.reshape(shape) }
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:

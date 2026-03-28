@@ -82,10 +82,10 @@ def load_cuda_ext():
         os.makedirs(build_dir, exist_ok=True)
         
         try:
-            print(f"[KudaHitam] Starting JIT Compilation (Mode: Gila Mode V7.5 Full Fusion)...")
-            _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir)
+            print(f"[KudaHitam] Starting JIT Compilation (Mode: Gila Mode V7.6 FP16 Native Engine)...")
+            _KudaHitamCUDA = load(name="KudaHitamCUDA_V76", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir)
             CUDA_EXT_AVAILABLE = True
-            print("[KudaHitam] [✓] ULTRA-GILA MODE ACTIVE: Monolithic Full Fusion (V7.5) fully loaded.")
+            print("[KudaHitam] [✓] ULTRA-GILA MODE ACTIVE: Monolithic Native FP16 (V7.6) fully loaded.")
         except Exception as e:
             print(f"[KudaHitam] [X] JIT Compilation failed! Error detail:\n{str(e)}")
             print("[KudaHitam] Falling back to Triton/PyTorch engine.")
@@ -323,7 +323,7 @@ class KudahitamCompressorV2:
     @torch.no_grad()
     def compress(self, states: torch.Tensor, offload: bool = True) -> dict:
         if isinstance(states, (list, tuple)): states = states[0]
-        dev = states.device; shape = [int(v) for v in states.shape]; flat = states.reshape(-1, shape[-1]).float()
+        dev = states.device; shape = [int(v) for v in states.shape]; flat = states.reshape(-1, shape[-1])
         # Random sampling for variance (1024 tokens for speed + accuracy)
         s_size = min(1024, flat.shape[0]); s_idx = torch.randint(0, flat.shape[0], (s_size,), device=dev) if s_size < flat.shape[0] else slice(None)
         
@@ -353,8 +353,8 @@ class KudahitamCompressorV2:
             
         # Priority: Ultra-Gila Mode (Ultra-Fused: Monolithic V7.5)
         cuda_ext = load_cuda_ext()
-        if CUDA_EXT_AVAILABLE and cuda_ext and flat_q.is_cuda and not self.use_fractional and not self.use_dynamic_codebook:
-            indices, vec_norms, k_mse = cuda_ext.ultra_fused_full_fusion(flat_q.contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
+        if CUDA_EXT_AVAILABLE and cuda_ext and flat.is_cuda and not self.use_fractional and not self.use_dynamic_codebook:
+            indices, vec_norms, k_mse = cuda_ext.ultra_fused_full_fusion(flat.contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
         else:
             # Fallback to standard Gila Mode or Triton/PyTorch
             vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)
@@ -377,7 +377,7 @@ class KudahitamCompressorV2:
             
         if self.use_vwh: k_mse = k_mse / self.vwh_weights
         residual = flat_q - k_mse; r_norm = torch.norm(residual, dim=-1); projected = fwht(residual * self.d); signs = (projected >= 0).to(torch.int8) * 2 - 1
-        return { "indices": indices, "norms": vec_norms.squeeze(-1).to(torch.float16), "p_indices": p_indices, "p_norms": p_norms.squeeze(-1).to(torch.float16) if p_norms is not None else None, "p_idx": self.protected_indices, "rank": len(shape), "shape": tuple(shape), "r_norm": r_norm.to(torch.float16).reshape(shape[:-1]), "k_mse": k_mse.to(torch.float16).reshape(shape), "signs": signs.reshape(shape), "is_domain": self.is_domain_layer }
+        return { "indices": indices, "norms": vec_norms.squeeze(-1).half(), "p_indices": p_indices, "p_norms": p_norms.squeeze(-1).half() if p_norms is not None else None, "p_idx": self.protected_indices, "rank": len(shape), "shape": tuple(shape), "r_norm": r_norm.half().reshape(shape[:-1]), "k_mse": k_mse.reshape(shape), "signs": signs.reshape(shape), "is_domain": self.is_domain_layer }
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:
