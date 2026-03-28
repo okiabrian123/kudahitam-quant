@@ -491,7 +491,7 @@ class KudahitamCompressorHBBA:
         cuda_ext = load_cuda_ext()
         indices, vec_norms, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.n_centroids_map)
         return { 
-            "indices": indices, 
+            "indices": indices.view(shape), 
             "norms": vec_norms.reshape(shape[:-1]), 
             "r_norm": r_norm.reshape(shape[:-1]), 
             "signs": signs.view(shape[:-1] + (-1,)) 
