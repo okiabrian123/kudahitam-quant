@@ -197,10 +197,12 @@ class KudahitamCompressorV2:
         if isinstance(states, (list, tuple)): states = states[0]
         dev = states.device; shape = [int(v) for v in states.shape]; flat = states.reshape(-1, shape[-1]).float()
         
-        # Priority: Ultra-Gila Mode (Ultra-Fused: Norm + Scale + FWHT + Quant)
+        # Priority: Gila Mode V2 (FWHT + Quantization)
+        vec_norms = torch.norm(flat, dim=-1, keepdim=True)
         cuda_ext = load_cuda_ext()
         if CUDA_EXT_AVAILABLE and cuda_ext and flat.is_cuda:
-            indices, vec_norms = cuda_ext.ultra_fused_compress(flat.contiguous(), self.d.float().contiguous(), self.centroids.to(dev).float().contiguous())
+            x_scaled = (flat.float() / (vec_norms + 1e-8)) * self.d
+            indices = cuda_ext.fused_compress(x_scaled.contiguous(), self.centroids.to(dev).float().contiguous())
             k_mse = fwht(self.centroids.to(dev)[indices.long()]) * self.d * vec_norms
         else:
             # Fallback to standard Gila Mode or Triton/PyTorch
