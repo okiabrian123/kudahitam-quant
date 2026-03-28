@@ -305,22 +305,14 @@ class KudahitamCompressorV2:
             else: flat_q[:, self.protected_indices] = 0.0
         else: p_indices = p_norms = None; flat_q = flat
             
-        vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)
-        
-        # Priority: Gila Mode Fused Compression (FWHT + Quantization)
+        # Priority: Ultra-Gila Mode (Ultra-Fused: Norm + Scale + FWHT + Quant)
         cuda_ext = load_cuda_ext()
-        if CUDA_EXT_AVAILABLE and cuda_ext and flat_q.is_cuda and not self.use_fractional:
-            if not self.use_dynamic_codebook:
-                x_scaled = (flat_q / (vec_norms + 1e-8)) * self.d
-                indices = cuda_ext.fused_compress(x_scaled.float().contiguous(), self.centroids.float().contiguous())
-                k_mse = fwht(self.centroids[indices.long()]) * self.d * vec_norms
-            else:
-                rotated = fwht((flat_q.float() / (vec_norms + 1e-8)) * self.d)
-                _a = rotated.abs().mean(); centroids = torch.tensor([-_a, _a], device=dev)
-                indices = (rotated.unsqueeze(-1) - centroids).abs().argmin(-1).to(torch.uint8)
-                k_mse = fwht(centroids[indices.long()]) * self.d * vec_norms
+        if CUDA_EXT_AVAILABLE and cuda_ext and flat_q.is_cuda and not self.use_fractional and not self.use_dynamic_codebook:
+            indices, vec_norms = cuda_ext.ultra_fused_compress(flat_q.contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
+            k_mse = fwht(self.centroids[indices.long()]) * self.d * vec_norms
         else:
-            # Fallback to Triton/PyTorch
+            # Fallback to standard Gila Mode or Triton/PyTorch
+            vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)
             rotated = fwht((flat_q.float() / (vec_norms + 1e-8)) * self.d)
             if self.use_dynamic_codebook:
                 _a = rotated.abs().mean(); centroids = torch.tensor([-_a, _a], device=dev)
@@ -328,8 +320,8 @@ class KudahitamCompressorV2:
             
             if self.use_fractional:
                 split_at = 64 if self.use_ultra else 128
-                c_h = 0.9816 * (rotated.abs().mean() / 0.79788)
-                c2 = torch.tensor([-c_h, 0.0, c_h], device=dev)
+                _sigma = rotated.abs().mean() / 0.79788
+                c_h = 0.9816 * _sigma; c2 = torch.tensor([-c_h, 0.0, c_h], device=dev)
                 idx0 = (rotated[:, :split_at].unsqueeze(-1) - c2).abs().argmin(-1).to(torch.uint8)
                 idx1 = (rotated[:, split_at:].unsqueeze(-1) - centroids).abs().argmin(-1).to(torch.uint8)
                 indices = torch.cat([idx0, idx1], dim=-1)
