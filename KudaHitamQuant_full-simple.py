@@ -157,10 +157,10 @@ def fwht(x: torch.Tensor):
         
     cuda_ext = load_cuda_ext()
     if CUDA_EXT_AVAILABLE and cuda_ext:
-        orig_shape = x.shape
-        x = x.reshape(-1, x.shape[-1]).contiguous()
+        orig_shape = x.shape; orig_dtype = x.dtype
+        x = x.reshape(-1, x.shape[-1]).float().contiguous()
         cuda_ext.forward(x)
-        return x.reshape(orig_shape)
+        return x.reshape(orig_shape).to(orig_dtype)
         
     # Priority 2: Bitwise-Optimized Triton (Blocked)
     if not TRITON_AVAILABLE: return fwht_pytorch(x)

@@ -215,10 +215,10 @@ def fwht(x: torch.Tensor):
         if not hasattr(fwht, '_notified'):
             print("[KudaHitam] [✓] FWHT: Using Hardware-Optimized CUDA Kernel.")
             fwht._notified = True
-        orig_shape = x.shape
-        x = x.reshape(-1, x.shape[-1]).contiguous()
+        orig_shape = x.shape; orig_dtype = x.dtype
+        x = x.reshape(-1, x.shape[-1]).float().contiguous()
         cuda_ext.forward(x)
-        return x.reshape(orig_shape)
+        return x.reshape(orig_shape).to(orig_dtype)
         
     # Priority 2: Bitwise-Optimized Triton (Blocked)
     if not TRITON_AVAILABLE:
