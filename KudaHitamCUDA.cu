@@ -350,18 +350,18 @@ __global__ void ultra_fused_hbba_fusion_kernel(
         r[j] = a + b; r[j + 4] = a - b;
     }
 
-    __shared__ half s_centroids[256][16];
+    __shared__ float s_centroids[256][16];
     __shared__ int s_n_c[256];
-
-    // Parallel load centroids to SRAM
+ 
+    // Parallel load centroids to SRAM (Now in FLOAT for maximum precision)
     for (int i = threadIdx.x; i < D * 16; i += threads_per_row) {
-        s_centroids[i / 16][i % 16] = __float2half(centroids_table[i]);
+        s_centroids[i / 16][i % 16] = centroids_table[i];
     }
     for (int i = threadIdx.x; i < D; i += threads_per_row) {
         s_n_c[i] = n_centroids_map[i];
     }
     __syncthreads();
-
+ 
     // HBBA Quantize
     float f_scale = 1.0f / sqrtf((float)D);
     #pragma unroll
@@ -372,11 +372,11 @@ __global__ void ultra_fused_hbba_fusion_kernel(
         float projected = r[k] * f_scale;
         uint8_t best_c = 0; float min_dist = 1e18f;
         for(int c = 0; c < n_centroids; ++c) {
-            float dist = fabsf(projected - __half2float(s_centroids[element_idx][c]));
+            float dist = fabsf(projected - s_centroids[element_idx][c]);
             if (dist < min_dist) { min_dist = dist; best_c = (uint8_t)c; }
         }
         out_idx[row_id * D + element_idx] = best_c;
-        r[k] = __half2float(s_centroids[element_idx][best_c]); 
+        r[k] = s_centroids[element_idx][best_c]; 
     }
 
     // Pass 2: FWHT (Reconstruct)
@@ -567,7 +567,14 @@ __global__ void hbba_calibrate_cuda_kernel(
         __syncthreads();
 
         if (threadIdx.x < n_c) {
-            if (s_counts[threadIdx.x] > 0) s_centroids[threadIdx.x] = s_sums[threadIdx.x] / (float)s_counts[threadIdx.x];
+            if (s_counts[threadIdx.x] > 0) {
+                s_centroids[threadIdx.x] = s_sums[threadIdx.x] / (float)s_counts[threadIdx.x];
+            } else {
+                // Dead cluster fix: Reset to uniform position to attempt re-capture
+                float b_min = rs_min[0];
+                float b_max = rs_max[0];
+                s_centroids[threadIdx.x] = b_min + (float)threadIdx.x * (b_max - b_min) / (float)fmaxf(1.0f, (float)(n_c - 1));
+            }
         }
         __syncthreads();
     }
