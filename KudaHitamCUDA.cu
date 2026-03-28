@@ -279,10 +279,6 @@ void fwht_cuda_forward(torch::Tensor x) {
     fwht_cuda_forward_kernel<<<blocks, threads, 0, stream>>>(x.data_ptr<float>(), D, N);
 }
 
-    );
-    return {out_idx, out_norms, out_kmse, out_r_norms, out_signs};
-}
-
 __global__ void ultra_fused_hbba_fusion_kernel(
     const half* __restrict__ x, 
     const float* __restrict__ d, 
