@@ -479,12 +479,10 @@ class KudahitamCompressorHBBA:
             quantized = c[indices.long()]
             return { "use_gaussian": True, "quantized": quantized.reshape(shape).half(), "norms": vec_norms.reshape(shape[:-1]).half() }
             
-        cuda_ext = load_cuda_ext()
-        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.n_centroids_map)
+        indices, vec_norms, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.n_centroids_map)
         return { 
             "indices": indices, 
             "norms": vec_norms.reshape(shape[:-1]), 
-            "k_mse": k_mse.view(shape), 
             "r_norm": r_norm.reshape(shape[:-1]), 
             "signs": signs.view(shape[:-1] + (-1,)) 
         }
@@ -497,7 +495,9 @@ class KudahitamCompressorHBBA:
             score = torch.matmul(q_proj, compressed["quantized"].half().transpose(-2, -1))
             return score * compressed["norms"].unsqueeze(-2)
             
-        k_mse = compressed["k_mse"].to(dev); signs_packed = compressed["signs"].to(dev)
+        indices = compressed["indices"].to(dev); signs_packed = compressed["signs"].to(dev)
+        # Reconstruct Base Cache on-the-fly (VRAM Savings)
+        k_mse = self.centroids_table[indices.long()]
         # Unpack 1-bit signs (V8.8.0 Bit-Stream Engine)
         signs = (((signs_packed.unsqueeze(-1) >> torch.arange(8, device=dev)) & 1).half() * 2 - 1)
         signs = signs.view(queries.shape[:-2] + (-1, self.head_dim)) # (B, H, S, D)

@@ -292,7 +292,6 @@ __global__ void ultra_fused_hbba_fusion_kernel(
     const int* __restrict__ n_centroids_map,   // [D]
     uint8_t* __restrict__ out_idx, 
     half* __restrict__ out_norms, 
-    half* __restrict__ out_kmse,
     half* __restrict__ out_r_norms,
     int8_t* __restrict__ out_signs,
     int D, int N) 
@@ -480,7 +479,6 @@ std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
 
     torch::Tensor out_idx = torch::empty({N, D}, idx_options);
     torch::Tensor out_norms = torch::empty({N, 1}, norm_options);
-    torch::Tensor out_kmse = torch::empty({N, D}, norm_options);
     torch::Tensor out_r_norms = torch::empty({N, 1}, norm_options);
     torch::Tensor out_signs = torch::empty({N, D / 8}, sign_options);
 
@@ -496,12 +494,11 @@ std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
         n_centroids_map.data_ptr<int>(),
         out_idx.data_ptr<uint8_t>(), 
         (half*)out_norms.data_ptr<at::Half>(), 
-        (half*)out_kmse.data_ptr<at::Half>(),
         (half*)out_r_norms.data_ptr<at::Half>(),
         (int8_t*)out_signs.data_ptr<int8_t>(),
         D, N
     );
-    return {out_idx, out_norms, out_kmse, out_r_norms, out_signs};
+    return {out_idx, out_norms, out_r_norms, out_signs};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
