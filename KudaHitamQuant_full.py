@@ -630,9 +630,10 @@ def main():
                         if "HBBA" in s_name:
                             comp = KudahitamCompressorHBBA(D, b_count, seed=l_idx, device=model.device, hbba_4bit_ratio=0.25)
                             comp.calibrate(keys) # Warm-up/Calibrate OUTSIDE timer
-                            b_eff = 1.75
-                            l_base = (b_eff * D / 8) + 2
-                            mem_total += l_base * H
+                            if ver == "V2": # Add memory only once
+                                b_eff = 1.75
+                                l_base = (b_eff * D / 8) + 2
+                                mem_total += l_base * H
                         elif ver == "V2":
                             curr_use_frac = is_f; curr_use_ultra = (is_f and "Ultra" in s_name)
                             comp = CompClass(D, b_count, seed=l_idx, device=model.device, is_domain_layer=is_d, use_outlier=use_out, domain_p_count=curr_p_dim, p_bits=curr_o_bits, use_spaced=("Spaced" in s_name), use_spectral=("Spectral" in s_name), use_vwh=("VWH" in s_name), use_dynamic_codebook=("Dynamic" in s_name), use_fractional=curr_use_frac, use_ultra=curr_use_ultra)

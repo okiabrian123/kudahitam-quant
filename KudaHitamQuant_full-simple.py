@@ -389,7 +389,7 @@ def main():
             # Final Table Collection
             if not hasattr(main, 'all_results'): main.all_results = []
 
-            strategies = [("1-bit Baseline", 1), ("2-bit Baseline", 2), ("3-bit Baseline", 3)]
+            strategies = [("1-bit Baseline", 1), ("2-bit Baseline", 2), ("HBBA-Hybrid (1/4-bit 25%)", 1.75)]
             for s_name, b_count in strategies:
                 res_row = {}; mem_total = 0
                 for ver in ["V2", "Gaussian"]:
@@ -399,9 +399,17 @@ def main():
                         if isinstance(keys, (tuple, list)): keys = keys[0]
                         D = keys.shape[-1]; q = (keys[:, :, -1:, :] if keys.ndim == 4 else keys[:, -1:, :]).float()
                         real = torch.matmul(q, keys.float().transpose(-2, -1))
-                        comp = CompClass(D, b_count, seed=l_idx, device=model.device)
-                        torch.cuda.synchronize(); t0 = time.perf_counter(); c = comp.compress(keys, offload=False); torch.cuda.synchronize(); comp_l.append(time.perf_counter() - t0); s = comp.asymmetric_attention_scores(q, c); cos_l.append(F.cosine_similarity(real.flatten(), s.flatten(), dim=0))
-                        mem_total += (b_count * D / 8 + 2) * keys.shape[1]
+                        if "HBBA" in s_name:
+                            comp = KudahitamCompressorHBBA(D, b_count, seed=l_idx, device=model.device, hbba_4bit_ratio=0.25)
+                            comp.calibrate(keys)
+                            if ver == "V2": # Guard for memory doubling
+                                b_eff = 1.75
+                                l_base = (b_eff * D / 8) + 2
+                                mem_total += l_base * keys.shape[1]
+                        else:
+                            comp = CompClass(D, b_count, seed=l_idx, device=model.device)
+                            if ver == "V2": # Guard for memory doubling
+                                mem_total += (b_count * D / 8 + 2) * keys.shape[1]
                     res_row[ver] = {"acc": (torch.stack(cos_l).mean().item()), "ms": (sum(comp_l)/len(comp_l))*1000}
                 print(f"Done: {ctx} | {task_name} | {s_name}")
                 main.all_results.append((ctx, task_name, s_name, res_row['V2']['acc'], res_row['Gaussian']['acc'], res_row['V2']['ms'], res_row['Gaussian']['ms'], mem_total))
