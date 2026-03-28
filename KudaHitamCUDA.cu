@@ -272,6 +272,16 @@ torch::Tensor ultra_fused_reconstruct_cuda(
 }
 
 
+void fwht_cuda_forward(torch::Tensor x) {
+    const int N = x.size(0);
+    const int D = x.size(1);
+    at::cuda::CUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    dim3 threads(D);
+    dim3 blocks(N);
+    fwht_kernel_legacy<<<blocks, threads, 0, stream>>>(x.data_ptr<float>(), D, N);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &fwht_cuda_forward, "KudaHitam FWHT Forward (Legacy)");
     m.def("ultra_fused_compress", &ultra_fused_compress_cuda, "KudaHitam Ultra-Fused Compression");
