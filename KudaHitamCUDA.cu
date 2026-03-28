@@ -279,10 +279,8 @@ void fwht_cuda_forward(torch::Tensor x) {
     fwht_cuda_forward_kernel<<<blocks, threads, 0, stream>>>(x.data_ptr<float>(), D, N);
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &fwht_cuda_forward, "KudaHitam Forward FWHT (Orthonormal)");
-    m.def("ultra_fused_full_fusion", &ultra_fused_full_fusion_cuda, "KudaHitam God Kernel V8.3 (Complete)");
-    m.def("ultra_fused_hbba_fusion", &ultra_fused_hbba_fusion_cuda, "KudaHitam HBBA God Kernel V8.5 (Hybrid 1/4-bit)");
+    );
+    return {out_idx, out_norms, out_kmse, out_r_norms, out_signs};
 }
 
 __global__ void ultra_fused_hbba_fusion_kernel(
@@ -490,4 +488,10 @@ std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
         D, N
     );
     return {out_idx, out_norms, out_kmse, out_r_norms, out_signs};
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("forward", &fwht_cuda_forward, "KudaHitam Forward FWHT (Orthonormal)");
+    m.def("ultra_fused_full_fusion", &ultra_fused_full_fusion_cuda, "KudaHitam God Kernel V8.3 (Complete)");
+    m.def("ultra_fused_hbba_fusion", &ultra_fused_hbba_fusion_cuda, "KudaHitam HBBA God Kernel V8.5 (Hybrid 1/4-bit)");
 }
