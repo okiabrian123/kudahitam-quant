@@ -443,10 +443,10 @@ __global__ void ultra_fused_hbba_fusion_kernel(
         r[j] = a + b; r[j + 4] = a - b;
     }
 
-    int8_t* out_signs_ptr = out_signs + row_id * D + lane_in_row * 8;
+    half* out_half_signs = ((half*)out_signs) + row_id * D + lane_in_row * 8;
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        out_signs_ptr[i] = (r[i] >= 0) ? (int8_t)1 : (int8_t)-1;
+        out_half_signs[i] = __float2half(r[i]);
     }
 }
 
@@ -458,7 +458,7 @@ std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
     
     auto idx_options = torch::TensorOptions().dtype(torch::kUInt8).device(x.device());
     auto norm_options = torch::TensorOptions().dtype(torch::kFloat32).device(x.device());
-    auto sign_options = torch::TensorOptions().dtype(torch::kInt8).device(x.device());
+    auto sign_options = torch::TensorOptions().dtype(torch::kFloat16).device(x.device());
 
     torch::Tensor out_idx = torch::empty({N, D}, idx_options);
     torch::Tensor out_norms = torch::empty({N, 1}, norm_options);
@@ -468,8 +468,8 @@ std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
 
     at::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    dim3 threads(256);
-    dim3 blocks((N * D + 2047) / 2048); 
+    dim3 threads(32); // row isolation
+    dim3 blocks(N); 
 
     ultra_fused_hbba_fusion_kernel<<<blocks, threads, 0, stream>>>(
         (const half*)x.data_ptr<at::Half>(), 
@@ -480,7 +480,7 @@ std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
         out_norms.data_ptr<float>(), 
         out_kmse.data_ptr<float>(),
         out_r_norms.data_ptr<float>(),
-        out_signs.data_ptr<int8_t>(),
+        (half*)out_signs.data_ptr<at::Half>(),
         D, N
     );
     return {out_idx, out_norms, out_kmse, out_r_norms, out_signs};
