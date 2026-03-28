@@ -441,7 +441,7 @@ def main():
                 if k is not None: head_dim = (k[0].shape[-1] if isinstance(k, (tuple, list)) else k.shape[-1]); break
     except Exception as e: print(f"Warning: head_dim detection failed ({e}), using default 256.")
 
-    print(f"Warming up GPU kernels ({model.device})..."); d_k = torch.randn(1, 1, 128, head_dim).to(model.device); d_q = torch.randn(1, 1, 1, head_dim).to(model.device)
+    print(f"Warming up GPU kernels ({model.device})..."); d_k = torch.randn(1, 1, 128, head_dim).to(model.device).half(); d_q = torch.randn(1, 1, 1, head_dim).to(model.device).half()
     for _ in range(5):
         for CC in [KudahitamCompressorV2, KudahitamCompressorGaussian]:
             comp = CC(head_dim, 1, seed=0, device=model.device); c = comp.compress(d_k, offload=False); _ = comp.asymmetric_attention_scores(d_q, c)
