@@ -549,8 +549,8 @@ __global__ void hbba_calibrate_cuda_kernel(
     }
     __syncthreads();
 
-    // 3. Lloyd-Max Iterations
-    for (int iter = 0; iter < 10; ++iter) {
+    // 3. Lloyd-Max Iterations (Increased to 50 for Deep Precision)
+    for (int iter = 0; iter < 50; ++iter) {
         if (threadIdx.x < 16) { s_sums[threadIdx.x] = 0.0f; s_counts[threadIdx.x] = 0; }
         __syncthreads();
 
