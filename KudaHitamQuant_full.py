@@ -429,17 +429,23 @@ class KudahitamCompressorHBBA:
     def __init__(self, head_dim: int, bits: int, seed: int, device: str = "cpu", hbba_4bit_ratio: float = 0.25):
         self.head_dim = head_dim; self.seed = seed; self.device = device; self.hbba_4bit_ratio = hbba_4bit_ratio
         self.d = (torch.randint(0, 2, (head_dim,), generator=torch.Generator().manual_seed(seed)) * 2 - 1).float().to(device)
-        self.centroids_table = None; self.n_centroids_map = None; self.is_calibrated = False
+        self.centroids_table = None; self.n_centroids_map = None; self.hbba_mask = None; self.is_calibrated = False
 
     def _calibrate_hbba(self, sample_rotated: torch.Tensor):
         dev = sample_rotated.device; D = self.head_dim
-        # 1. Variance-based allocation
+        # Variance-based allocation
         variances = sample_rotated.var(0); num_4bit = int(D * self.hbba_4bit_ratio)
         top_indices = torch.topk(variances, num_4bit).indices
         
         self.n_centroids_map = torch.full((D,), 2, dtype=torch.int32, device=dev); self.n_centroids_map[top_indices] = 16
         
-        # 2. Atomic CUDA Calibrator (Lloyd-Max in GPU SRAM) - V8.7
+        # 1. Convert to 256-bit mask (Symmetry Nexus V8.8.1)
+        mask_np = np.zeros(8, dtype=np.uint32)
+        top_indices_np = top_indices.cpu().numpy()
+        for idx in top_indices_np: mask_np[idx // 32] |= (1 << (idx % 32))
+        self.hbba_mask = torch.from_numpy(mask_np.astype(np.int32)).to(dev)
+
+        # 2. Atomic CUDA Calibrator (Lloyd-Max in GPU SRAM)
         cuda_ext = load_cuda_ext()
         self.centroids_table = cuda_ext.hbba_calibrate_cuda(sample_rotated.float().contiguous(), self.n_centroids_map.contiguous())
         self.is_calibrated = True
@@ -469,16 +475,9 @@ class KudahitamCompressorHBBA:
         dev = states.device; shape = states.shape; flat = states.reshape(-1, shape[-1]).half()
         cuda_ext = load_cuda_ext()
         if not self.is_calibrated: self.calibrate(states)
-        
-        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(
-            flat.contiguous(), self.d.to(dev).contiguous(), 
-            self.centroids_table, self.n_centroids_map
-        )
-        return {
-            "indices": indices, "norms": vec_norms.squeeze(-1), "k_mse": k_mse.view(shape),
-            "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]), "signs": signs.view(shape),
-            "shape": tuple(shape)
-        }
+        # Call with hbba_mask instead of the full map
+        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.hbba_mask)
+        return { "indices": indices, "norms": vec_norms.squeeze(-1), "k_mse": k_mse.view(shape), "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]), "signs": signs.view(shape), "shape": tuple(shape) }
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:
