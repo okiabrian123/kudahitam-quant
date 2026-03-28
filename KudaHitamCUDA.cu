@@ -28,7 +28,6 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
 
     int lane_id = threadIdx.x & 31;
     int threads_per_row = D / 8; 
-    int row_start_lane = (lane_id / threads_per_row) * threads_per_row;
     int lane_in_row = lane_id % threads_per_row;
 
     float r[8];
@@ -42,14 +41,14 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
         half2 val2 = x_ptr[i];
         orig[i*2] = __half2float(val2.x);
         orig[i*2 + 1] = __half2float(val2.y);
-        sum_sq += orig[i*2]*orig[i*2] + orig[i*2+1]*orig[i*2+1];
+        sum_sq += orig[i*2]*orig[i*2] + orig[i*2 + 1]*orig[i*2 + 1];
     }
 
-    // 2. Norm Reduction
+    // 2. Norm Reduction - Strict Isolation
     for (int offset = threads_per_row >> 1; offset > 0; offset >>= 1) {
-        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset, threads_per_row);
     }
-    float norm = __shfl_sync(0xffffffff, sum_sq > 0 ? sqrtf(sum_sq) : 1e-8f, row_start_lane);
+    float norm = __shfl_sync(0xffffffff, sum_sq > 0 ? sqrtf(sum_sq) : 1e-8f, 0, threads_per_row);
     if (lane_in_row == 0) out_norms[row_id] = norm;
     
     // 3. Forward Projection Prep
@@ -57,7 +56,7 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
     #pragma unroll
     for(int k=0; k<8; ++k) r[k] = (orig[k] * d_row[k]) / norm;
 
-    // 4. Pass 1: FWHT (Forward) - Unnormalized
+    // 4. Pass 1: FWHT (Forward)
     #pragma unroll
     for(int step = 1; step <= 2; step <<= 1) {
         #pragma unroll
@@ -74,7 +73,7 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
     for(int t_step = 1; t_step < threads_per_row; t_step <<= 1) {
         #pragma unroll
         for(int k = 0; k < 8; ++k) {
-            float other = __shfl_xor_sync(0xffffffff, r[k], t_step);
+            float other = __shfl_xor_sync(0xffffffff, r[k], t_step, threads_per_row);
             if ((lane_in_row & t_step) == 0) r[k] = r[k] + other;
             else r[k] = other - r[k];
         }
@@ -85,7 +84,7 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
         r[j] = a + b; r[j + 4] = a - b;
     }
 
-    // 5. Quantize - Apply 1/sqrt(D) to match orthonormal centroids
+    // 5. Quantize - Orthonormal Scaling
     float f_scale = 1.0f / sqrtf((float)D);
     uint8_t out_c[8];
     #pragma unroll
@@ -125,7 +124,7 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
     for(int t_step = 1; t_step < threads_per_row; t_step <<= 1) {
         #pragma unroll
         for(int k = 0; k < 8; ++k) {
-            float other = __shfl_xor_sync(0xffffffff, r[k], t_step);
+            float other = __shfl_xor_sync(0xffffffff, r[k], t_step, threads_per_row);
             if ((lane_in_row & t_step) == 0) r[k] = r[k] + other;
             else r[k] = other - r[k];
         }
@@ -136,7 +135,7 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
         r[j] = a + b; r[j + 4] = a - b;
     }
 
-    // 7. Residual & Second Norm - Correct 1/sqrt(D) Scaling 
+    // 7. Residual & Second Norm - Correct Orthonormal Scaling 
     float b_scale = 1.0f / sqrtf((float)D); 
     float m_base = b_scale * norm;
     float res_sum_sq = 0.0f;
@@ -146,14 +145,14 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
         float k_mse_val = r[i] * m_base * d_row[i];
         out_kmse_ptr[i] = k_mse_val;
         float diff = orig[i] - k_mse_val;
-        r[i] = diff * d_row[i]; // Prep for Pass 3 (Signs)
+        r[i] = diff * d_row[i]; 
         res_sum_sq += diff * diff;
     }
     
     for (int offset = threads_per_row >> 1; offset > 0; offset >>= 1) {
-        res_sum_sq += __shfl_down_sync(0xffffffff, res_sum_sq, offset);
+        res_sum_sq += __shfl_down_sync(0xffffffff, res_sum_sq, offset, threads_per_row);
     }
-    float r_norm = __shfl_sync(0xffffffff, res_sum_sq > 0 ? sqrtf(res_sum_sq) : 1e-8f, row_start_lane);
+    float r_norm = __shfl_sync(0xffffffff, res_sum_sq > 0 ? sqrtf(res_sum_sq) : 1e-8f, 0, threads_per_row);
     if (lane_in_row == 0) out_r_norms[row_id] = r_norm;
 
     // 8. Pass 3: FWHT (Signs Projection)
@@ -173,7 +172,7 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
     for(int t_step = 1; t_step < threads_per_row; t_step <<= 1) {
         #pragma unroll
         for(int k = 0; k < 8; ++k) {
-            float other = __shfl_xor_sync(0xffffffff, r[k], t_step);
+            float other = __shfl_xor_sync(0xffffffff, r[k], t_step, threads_per_row);
             if ((lane_in_row & t_step) == 0) r[k] = r[k] + other;
             else r[k] = other - r[k];
         }
@@ -232,5 +231,5 @@ void fwht_cuda_forward_warp(torch::Tensor x) {}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &fwht_cuda_forward_warp, "Reserved");
-    m.def("ultra_fused_full_fusion", &ultra_fused_full_fusion_cuda, "KudaHitam God Kernel V8.0");
+    m.def("ultra_fused_full_fusion", &ultra_fused_full_fusion_cuda, "KudaHitam God Kernel V8.2 (Strict Isolation)");
 }
