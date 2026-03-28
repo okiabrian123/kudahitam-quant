@@ -473,29 +473,14 @@ class KudahitamCompressorHBBA:
         if self.use_gaussian:
             # Fallback to Python-side Gaussian HBBA for Baseline Comparison
             norm = torch.norm(flat, dim=-1, keepdim=True)
-            if self.P.device != dev: self.P = self.P.to(dev)
-            vec_norms = torch.norm(flat, dim=-1, keepdim=True)
-            rotated = (flat.float() / (vec_norms.float() + 1e-8)) @ self.P.float().T
-            # Multi-level quantization (simplified for Gaussian fallback)
-            # Just use 4-bit (16 levels) for all as an upper bound logic for ablation
-            n_levels = 16
-            c = torch.linspace(rotated.min(), rotated.max(), n_levels, device=dev)
-            indices = (rotated.unsqueeze(-1) - c).abs().argmin(-1).to(torch.uint8)
-            quantized = c[indices.long()]
-            return {
-                "use_gaussian": True,
-                "quantized": quantized.reshape(shape).half(),
-                "norms": vec_norms.reshape(shape[:-1]).half()
-            }
-            
+            rotated = (flat.float() / (norm+1e-8)) @ self.P.float().T
+            indices = (rotated.unsqueeze(-1) - self.centroids_table).abs().argmin(-1).to(torch.uint8)
+            quantized = self.centroids_table[torch.arange(self.head_dim, device=dev), indices.long()]
+            return { "indices": indices, "norms": norm, "quantized": quantized, "shape": tuple(shape), "use_gaussian": True }
+
         cuda_ext = load_cuda_ext()
-        indices, vec_norms, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.n_centroids_map)
-        return { 
-            "indices": indices.view(shape), 
-            "norms": vec_norms.reshape(shape[:-1]), 
-            "r_norm": r_norm.reshape(shape[:-1]), 
-            "signs": signs.view(shape[:-1] + (-1,)) 
-        }
+        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.n_centroids_map)
+        return { "indices": indices, "norms": vec_norms.squeeze(-1), "k_mse": k_mse.view(shape), "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]), "signs": signs.view(shape), "shape": tuple(shape), "use_gaussian": False }
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:
@@ -505,20 +490,11 @@ class KudahitamCompressorHBBA:
             score = torch.matmul(q_proj, compressed["quantized"].half().transpose(-2, -1))
             return score * compressed["norms"].unsqueeze(-2)
             
-        indices = compressed["indices"].to(dev); signs_packed = compressed["signs"].to(dev); norms = compressed["norms"].to(dev)
-        # Reconstruct Base Cache on-the-fly (V8.9.4 Dimension-Robust Gather)
-        B, H, S, D = indices.shape
-        k_mse = self.centroids_table.gather(1, indices.long().reshape(-1, D).T).T.reshape(B, H, S, D)
-        k_mse = (k_mse * norms.unsqueeze(-1) * (1.0 / self.head_dim)).half()
-        # Unpack 1-bit signs (V8.8.0 Bit-Stream Engine)
-        signs = (((signs_packed.unsqueeze(-1) >> torch.arange(8, device=dev)) & 1).half() * 2 - 1)
-        signs = signs.view(queries.shape[:-2] + (-1, self.head_dim)) # (B, H, S, D)
-        
+        k_mse = compressed["k_mse"].to(dev); signs = compressed["signs"].to(dev); r_norm = compressed["r_norm"].to(dev)
         term1 = torch.matmul(queries.half(), k_mse.transpose(-2, -1))
         q_proj = fwht(queries.half() * self.d.to(dev).half()); qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1))
-        
-        scale = 1.0 / self.head_dim; r_norm = compressed["r_norm"].to(dev)
-        return term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
+        scale = 1.0 / math.sqrt(self.head_dim); out = term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
+        return out
 
 
 # =============================================================================
@@ -627,13 +603,11 @@ def main():
                         curr_p_dim = d_p if is_d else 0; curr_o_bits = o_bits
                         
                         if "HBBA" in s_name:
-                            # HBBA Memory Logic (V8.8.0): Indices (1/4-bit avg 1.75 bit) + Signs (1 bit) + Norms + RNorms
-                            # In practice with bit-packing: (D * 1.75 / 8) + (D / 8) + 2 + 2 = 92 bytes
                             comp = KudahitamCompressorHBBA(D, b_count, seed=l_idx, device=model.device, hbba_4bit_ratio=0.25, use_gaussian=(ver == "Gaussian"))
                             comp.calibrate(keys) # Warm-up/Calibrate OUTSIDE timer
                             if ver == "V2": # Add memory only once
-                                b_eff = 2.75
-                                l_base = (b_eff * D / 8) + 4
+                                b_eff = 1.75
+                                l_base = (b_eff * D / 8) + 2
                                 mem_total += l_base * H
                         elif ver == "V2":
                             curr_use_frac = is_f; curr_use_ultra = (is_f and "Ultra" in s_name)

@@ -470,22 +470,17 @@ class KudahitamCompressorHBBA:
         
         if self.use_gaussian:
             norm = torch.norm(flat, dim=-1, keepdim=True)
-            if self.P.device != dev: self.P = self.P.to(dev)
-            vec_norms = torch.norm(flat, dim=-1, keepdim=True)
-            rotated = (flat.float() / (vec_norms.float() + 1e-8)) @ self.P.float().T
-            n_levels = 16 # 4-bit ablation
-            c = torch.linspace(rotated.min(), rotated.max(), n_levels, device=dev)
-            indices = (rotated.unsqueeze(-1) - c).abs().argmin(-1).to(torch.uint8)
-            quantized = c[indices.long()]
-            return { "use_gaussian": True, "quantized": quantized.reshape(shape).half(), "norms": vec_norms.reshape(shape[:-1]).half() }
-            
+            rotated = (flat.float() / (norm+1e-8)) @ self.P.float().T
+            indices = (rotated.unsqueeze(-1) - self.centroids_table).abs().argmin(-1).to(torch.uint8)
+            quantized = self.centroids_table[torch.arange(self.head_dim, device=dev), indices.long()]
+            return { "indices": indices, "norms": norm, "quantized": quantized, "shape": tuple(shape), "use_gaussian": True }
+
         cuda_ext = load_cuda_ext()
-        indices, vec_norms, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.n_centroids_map)
-        return { 
-            "indices": indices.view(shape), 
-            "norms": vec_norms.reshape(shape[:-1]), 
-            "r_norm": r_norm.reshape(shape[:-1]), 
-            "signs": signs.view(shape[:-1] + (-1,)) 
+        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.n_centroids_map)
+        return {
+            "indices": indices, "norms": vec_norms.squeeze(-1), "k_mse": k_mse.view(shape),
+            "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]), "signs": signs.view(shape),
+            "shape": tuple(shape), "use_gaussian": False
         }
 
     @torch.no_grad()
@@ -496,20 +491,11 @@ class KudahitamCompressorHBBA:
             score = torch.matmul(q_proj, compressed["quantized"].half().transpose(-2, -1))
             return score * compressed["norms"].unsqueeze(-2)
             
-        indices = compressed["indices"].to(dev); signs_packed = compressed["signs"].to(dev); norms = compressed["norms"].to(dev)
-        # Reconstruct Base Cache on-the-fly (V8.9.4 Dimension-Robust Gather)
-        B, H, S, D = indices.shape
-        k_mse = self.centroids_table.gather(1, indices.long().reshape(-1, D).T).T.reshape(B, H, S, D)
-        k_mse = (k_mse * norms.unsqueeze(-1) * (1.0 / self.head_dim)).half()
-        # Unpack 1-bit signs (V8.8.0 Bit-Stream Engine)
-        signs = (((signs_packed.unsqueeze(-1) >> torch.arange(8, device=dev)) & 1).half() * 2 - 1)
-        signs = signs.view(queries.shape[:-2] + (-1, self.head_dim)) # (B, H, S, D)
-        
+        k_mse = compressed["k_mse"].to(dev); signs = compressed["signs"].to(dev); r_norm = compressed["r_norm"].to(dev)
         term1 = torch.matmul(queries.half(), k_mse.transpose(-2, -1))
         q_proj = fwht(queries.half() * self.d.to(dev).half()); qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1))
-        
-        scale = 1.0 / self.head_dim; r_norm = compressed["r_norm"].to(dev)
-        return term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
+        scale = 1.0 / math.sqrt(self.head_dim); out = term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
+        return out
 
 
 # =============================================================================

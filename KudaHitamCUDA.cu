@@ -270,19 +270,13 @@ __global__ void fwht_cuda_forward_kernel(float* __restrict__ x, int D, int N) {
 }
 
 void fwht_cuda_forward(torch::Tensor x) {
-    auto x_float = x.to(torch::kFloat32); // Safe fallback for legacy FWHT kernel
-    const int N = x_float.size(0);
-    const int D = x_float.size(1);
-    at::cuda::CUDAGuard device_guard(x_float.device());
+    const int N = x.size(0);
+    const int D = x.size(1);
+    at::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     dim3 threads(256);
     dim3 blocks((N * D + 2047) / 2048); 
-    fwht_cuda_forward_kernel<<<blocks, threads, 0, stream>>>(x_float.data_ptr<float>(), D, N);
-    
-    // Copy back result if it was half (since it's in-place)
-    if (x.scalar_type() == torch::kHalf) {
-        x.copy_(x_float);
-    }
+    fwht_cuda_forward_kernel<<<blocks, threads, 0, stream>>>(x.data_ptr<float>(), D, N);
 }
 
 __global__ void ultra_fused_hbba_fusion_kernel(
@@ -292,20 +286,11 @@ __global__ void ultra_fused_hbba_fusion_kernel(
     const int* __restrict__ n_centroids_map,   // [D]
     uint8_t* __restrict__ out_idx, 
     half* __restrict__ out_norms, 
+    half* __restrict__ out_kmse,
     half* __restrict__ out_r_norms,
-    int8_t* __restrict__ out_signs,
+    half* __restrict__ out_signs,
     int D, int N) 
 {
-    // Innovations V8.7: Shared Centroid Cache (LDS)
-    __shared__ float s_centroids[256 * 16]; // 16KB for D=256
-    
-    // Parallel Load Table into SRAM
-    int total_elements = D * 16;
-    for (int i = threadIdx.x; i < total_elements; i += blockDim.x) {
-        if (i < 4096) s_centroids[i] = centroids_table[i];
-    }
-    __syncthreads();
-
     int global_thread_id = blockIdx.x * blockDim.x + threadIdx.x;
     int row_id = (global_thread_id * 8) / D;
     if (row_id >= N) return;
@@ -371,7 +356,7 @@ __global__ void ultra_fused_hbba_fusion_kernel(
     for(int k = 0; k < 8; ++k) {
         int element_idx = lane_in_row * 8 + k;
         int n_centroids = n_centroids_map[element_idx];
-        const float* centroids = s_centroids + element_idx * 16;
+        const float* centroids = centroids_table + element_idx * 16;
         
         float projected = r[k] * f_scale;
         uint8_t best_c = 0; float min_dist = 1e18f;
@@ -411,12 +396,14 @@ __global__ void ultra_fused_hbba_fusion_kernel(
         r[j] = a + b; r[j + 4] = a - b;
     }
 
-    float b_scale = 1.0f / (float)D; 
+    float b_scale = 1.0f / sqrtf((float)D); 
     float m_base = b_scale * norm;
     float res_sum_sq = 0.0f;
+    half* out_kmse_ptr = out_kmse + row_id * D + lane_in_row * 8;
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
         float k_mse_val = r[i] * m_base * d_row[i];
+        out_kmse_ptr[i] = __float2half(k_mse_val);
         float diff = orig[i] - k_mse_val;
         r[i] = diff * d_row[i]; 
         res_sum_sq += diff * diff;
@@ -456,13 +443,11 @@ __global__ void ultra_fused_hbba_fusion_kernel(
         r[j] = a + b; r[j + 4] = a - b;
     }
 
-    uint8_t* out_packed_signs = (uint8_t*)out_signs + row_id * (D/8) + lane_in_row;
-    uint8_t pack = 0;
+    half* out_half_signs = ((half*)out_signs) + row_id * D + lane_in_row * 8;
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        if (r[i] >= 0) pack |= (1 << i);
+        out_half_signs[i] = __float2half(r[i]);
     }
-    *out_packed_signs = pack;
 }
 
 std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
@@ -473,12 +458,13 @@ std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
     
     auto idx_options = torch::TensorOptions().dtype(torch::kUInt8).device(x.device());
     auto norm_options = torch::TensorOptions().dtype(torch::kFloat16).device(x.device());
-    auto sign_options = torch::TensorOptions().dtype(torch::kInt8).device(x.device());
+    auto sign_options = torch::TensorOptions().dtype(torch::kFloat16).device(x.device());
 
     torch::Tensor out_idx = torch::empty({N, D}, idx_options);
     torch::Tensor out_norms = torch::empty({N, 1}, norm_options);
+    torch::Tensor out_kmse = torch::empty({N, D}, norm_options);
     torch::Tensor out_r_norms = torch::empty({N, 1}, norm_options);
-    torch::Tensor out_signs = torch::empty({N, D / 8}, sign_options);
+    torch::Tensor out_signs = torch::empty({N, D}, sign_options);
 
     at::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -492,11 +478,12 @@ std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
         n_centroids_map.data_ptr<int>(),
         out_idx.data_ptr<uint8_t>(), 
         (half*)out_norms.data_ptr<at::Half>(), 
+        (half*)out_kmse.data_ptr<at::Half>(),
         (half*)out_r_norms.data_ptr<at::Half>(),
-        (int8_t*)out_signs.data_ptr<int8_t>(),
+        (half*)out_signs.data_ptr<at::Half>(),
         D, N
     );
-    return {out_idx, out_norms, out_r_norms, out_signs};
+    return {out_idx, out_norms, out_kmse, out_r_norms, out_signs};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
