@@ -567,20 +567,19 @@ def main():
                 layer_variances.append((l_idx, ratio))
             layer_variances.sort(key=lambda x: x[1], reverse=True)
             ranked_active = [x[0] for x in layer_variances]
+            
+            top2_sens = ranked_active[:2]; mid_act = active_indices[len(active_indices)//2]
+            selective_hbba_set = set(top2_sens + [mid_act])
 
-            # Final Table Collection
-            if not hasattr(main, 'all_results'): main.all_results = []
-
-            # Positional Strategies Indices (for 6 active layers)
-            n_act = len(active_indices); mid = n_act // 2
-            # Strategies: (Name, Bits, Outlier_Idxs, Use_Outlier, Outlier_P, Outlier_Bits, Frac_Idxs)
+            # Strategies: (Name, Bits, Outlier_Idxs, Use_Outlier, Outlier_P, Outlier_Bits, Frac_Idxs, Selective_Set)
             strategies = [
-                ("1-bit Baseline", 1, [], False, 0, 4, []),
-                ("2-bit Baseline", 2, [], False, 0, 4, []),
-                ("HBBA-Hybrid (1/4-bit 25%)", 1.75, [], False, 0, 0, [])
+                ("1-bit Baseline", 1, [], False, 0, 4, [], set()),
+                ("2-bit Baseline", 2, [], False, 0, 4, [], set()),
+                ("HBBA-Hybrid (1/4-bit 25%)", 1.75, [], False, 0, 0, [], set(active_indices)),
+                ("Selective HBBA (Top2 + Mid)", 1.75, [], False, 0, 0, [], selective_hbba_set)
             ]
 
-            for s_name, b_count, d_set, use_out, d_p, o_bits, f_set in strategies:
+            for s_name, b_count, d_set, use_out, d_p, o_bits, f_set, s_set in strategies:
                 res_row = {}; mem_total = 0
                 for ver in ["V2", "Gaussian"]:
                     if "HBBA" in s_name and ver == "Gaussian":
@@ -593,26 +592,25 @@ def main():
                         B, H, S, D = keys.shape
                         q = (keys[:, :, -1:, :] if keys.ndim == 4 else keys[:, -1:, :]).float()
                         real = torch.matmul(q, (keys_f := keys.float()).transpose(-2, -1))
-                        is_d = (l_idx in d_set); is_f = (l_idx in f_set)
                         
-                        # Logic: Domain dimensions ONLY for d_set, else 0 outlier for Selective feel.
-                        curr_p_dim = d_p if is_d else 0; curr_o_bits = o_bits
                         if "HBBA" in s_name:
-                            comp = KudahitamCompressorHBBA(D, b_count, seed=l_idx, device=model.device, hbba_4bit_ratio=0.25)
-                            comp.calibrate(keys) # Warm-up/Calibrate OUTSIDE timer
-                            b_eff = 1.75
+                            if l_idx in s_set:
+                                comp = KudahitamCompressorHBBA(D, b_count, seed=l_idx, device=model.device, hbba_4bit_ratio=0.25)
+                                b_eff = 1.75
+                            else:
+                                comp = KudahitamCompressorV2(D, 1, seed=l_idx, device=model.device) # Baseline 1-bit
+                                b_eff = 1.0
+                            comp.calibrate(keys) 
                             l_base = (b_eff * D / 8) + 2
                             mem_total += l_base * H
                         elif ver == "V2":
-                            curr_use_frac = is_f; curr_use_ultra = (is_f and "Ultra" in s_name)
-                            comp = CompClass(D, b_count, seed=l_idx, device=model.device, is_domain_layer=is_d, use_outlier=use_out, domain_p_count=curr_p_dim, p_bits=curr_o_bits, use_spaced=("Spaced" in s_name), use_spectral=("Spectral" in s_name), use_vwh=("VWH" in s_name), use_dynamic_codebook=("Dynamic" in s_name), use_fractional=curr_use_frac, use_ultra=curr_use_ultra)
-                            b_eff = 1.25 if curr_use_ultra else (1.5 if curr_use_frac else b_count)
+                            is_d = (l_idx in d_set); is_f = (l_idx in f_set)
+                            comp = CompClass(D, b_count, seed=l_idx, device=model.device, is_domain_layer=is_d, use_outlier=use_out, domain_p_count=(d_p if is_d else 0), p_bits=o_bits)
+                            b_eff = b_count
                             l_base = (b_eff * D / 8) + 2
-                            l_out = ((curr_p_dim * curr_o_bits / 8) + 2) if (use_out and is_d) else 0
-                            mem_total += (l_base + l_out) * H
+                            mem_total += l_base * H
                         else:
-                            p_count_g = curr_p_dim if (is_d and use_out) else (16 if use_out else 0)
-                            comp = CompClass(D, b_count, seed=l_idx, device=model.device, protected_dim_count=p_count_g)
+                            comp = CompClass(D, b_count, seed=l_idx, device=model.device)
                             
                         torch.cuda.synchronize(); t0 = time.perf_counter(); c = comp.compress(keys, offload=False); torch.cuda.synchronize(); comp_l.append(time.perf_counter() - t0); s = comp.asymmetric_attention_scores(q, c); cos_l.append(F.cosine_similarity(real.flatten(), s.flatten(), dim=0))
                     res_row[ver] = {"acc": (torch.stack(cos_l).mean().item()), "ms": (sum(comp_l)/len(comp_l))*1000}
