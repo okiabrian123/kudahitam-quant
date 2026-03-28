@@ -204,40 +204,21 @@ if TRITON_AVAILABLE:
 # --- WRAPPER FUNCTIONS ---
 
 def fwht(x: torch.Tensor):
-    if not x.is_cuda:
-        if not hasattr(fwht, '_notified'):
-            print("[KudaHitam] [!] FWHT: Input not on CUDA. Using PyTorch fallback.")
-            fwht._notified = True
-        return fwht_pytorch(x)
+    if not x.is_cuda: return fwht_pytorch(x)
         
     cuda_ext = load_cuda_ext()
     if CUDA_EXT_AVAILABLE and cuda_ext:
-        if not hasattr(fwht, '_notified'):
-            print("[KudaHitam] [✓] FWHT: Using Hardware-Optimized CUDA Kernel.")
-            fwht._notified = True
         orig_shape = x.shape
         x = x.reshape(-1, x.shape[-1]).contiguous()
         cuda_ext.forward(x)
         return x.reshape(orig_shape)
         
     # Priority 2: Bitwise-Optimized Triton (Blocked)
-    if not TRITON_AVAILABLE:
-        if not hasattr(fwht, '_notified'):
-            print("[KudaHitam] [!] FWHT: CUDA Extension & Triton unavailable. Using PyTorch fallback.")
-            fwht._notified = True
-        return fwht_pytorch(x)
+    if not TRITON_AVAILABLE: return fwht_pytorch(x)
         
     orig_shape = x.shape
     x = x.reshape(-1, x.shape[-1]).contiguous(); D = x.shape[-1]
-    if (D & (D - 1)) != 0:
-        if not hasattr(fwht, '_notified'):
-            print(f"[KudaHitam] [!] FWHT: D={D} is not power-of-2. Using PyTorch fallback.")
-            fwht._notified = True
-        return fwht_pytorch(x)
-        
-    if not hasattr(fwht, '_notified'):
-        print("[KudaHitam] [✓] FWHT: Using Bitwise-Optimized Triton Kernel.")
-        fwht._notified = True
+    if (D & (D - 1)) != 0: return fwht_pytorch(x)
         
     y = torch.empty_like(x)
     with torch.cuda.device(x.device):
@@ -352,11 +333,6 @@ class KudahitamCompressorV2:
             indices, vec_norms = cuda_ext.ultra_fused_compress(flat_q.contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
             k_mse = cuda_ext.ultra_fused_reconstruct(indices, vec_norms, self.centroids.float().contiguous(), self.d.float().contiguous())
         else:
-            if not hasattr(self, '_gila_notified'):
-                reason = "CUDA extension not available" if not CUDA_EXT_AVAILABLE else "Input not on CUDA device" if not flat_q.is_cuda else "Unsupported mode (Fractional/Dynamic)"
-                print(f"[KudaHitam] [!] Task Compression: Falling back to Triton/PyTorch. (Reason: {reason})")
-                self._gila_notified = True
-            
             # Fallback to standard Gila Mode or Triton/PyTorch
             vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)
             rotated = fwht((flat_q.float() / (vec_norms + 1e-8)) * self.d)
