@@ -305,12 +305,11 @@ class KudahitamCompressorV2:
             else: flat_q[:, self.protected_indices] = 0.0
         else: p_indices = p_norms = None; flat_q = flat
             
+        # Priority: Gila Mode V3 (Semi-Fused: FWHT + Quantization + Inline Scaling)
         vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)
-        # Priority: Gila Mode V2 (FWHT + Quantization)
         cuda_ext = load_cuda_ext()
         if CUDA_EXT_AVAILABLE and cuda_ext and flat_q.is_cuda and not self.use_fractional and not self.use_dynamic_codebook:
-            x_scaled = (flat_q / (vec_norms + 1e-8)) * self.d
-            indices = cuda_ext.fused_compress(x_scaled.float().contiguous(), self.centroids.float().contiguous())
+            indices = cuda_ext.fused_compress(flat_q.float().contiguous(), vec_norms.float().contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
             k_mse = fwht(self.centroids[indices.long()]) * self.d * vec_norms
         else:
             # Fallback to Triton/PyTorch

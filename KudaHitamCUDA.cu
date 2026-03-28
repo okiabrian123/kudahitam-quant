@@ -45,6 +45,8 @@ __global__ void fwht_kernel_legacy(float* __restrict__ x, int D, int N) {
 
 __global__ void fused_compress_kernel(
     const float* __restrict__ x, 
+    const float* __restrict__ vec_norms,
+    const float* __restrict__ d,
     const float* __restrict__ centroids, 
     uint8_t* __restrict__ out, 
     int D, int N, int n_centroids) 
@@ -54,7 +56,12 @@ __global__ void fused_compress_kernel(
     int tid = threadIdx.x;
     
     __shared__ float sdata[1024]; 
-    float val = x[row_idx * D + tid];
+    
+    // Gila Mode V3: Fused Load & Scale
+    float x_val = x[row_idx * D + tid];
+    float norm_val = vec_norms[row_idx] + 1e-8f;
+    float d_val = d[tid];
+    float val = (x_val / norm_val) * d_val;
     
     fwht_warp(val, 16);
     sdata[tid] = val; __syncthreads();
@@ -93,7 +100,7 @@ void fwht_cuda_forward(torch::Tensor x) {
     fwht_kernel_legacy<<<blocks, threads, 0, stream>>>(x.data_ptr<float>(), D, N);
 }
 
-torch::Tensor fused_compress_cuda(torch::Tensor x, torch::Tensor centroids) {
+torch::Tensor fused_compress_cuda(torch::Tensor x, torch::Tensor norms, torch::Tensor d, torch::Tensor centroids) {
     const int N = x.size(0);
     const int D = x.size(1);
     const int n_centroids = centroids.size(0);
@@ -105,6 +112,8 @@ torch::Tensor fused_compress_cuda(torch::Tensor x, torch::Tensor centroids) {
     dim3 threads(D);
     fused_compress_kernel<<<blocks, threads, 0, stream>>>(
         x.data_ptr<float>(), 
+        norms.data_ptr<float>(),
+        d.data_ptr<float>(),
         centroids.data_ptr<float>(), 
         out.data_ptr<uint8_t>(), 
         D, N, n_centroids
