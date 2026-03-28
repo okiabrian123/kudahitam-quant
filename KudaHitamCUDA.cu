@@ -411,14 +411,12 @@ __global__ void ultra_fused_hbba_fusion_kernel(
         r[j] = a + b; r[j + 4] = a - b;
     }
 
-    float b_scale = 1.0f / sqrtf((float)D); 
+    float b_scale = 1.0f / (float)D; 
     float m_base = b_scale * norm;
     float res_sum_sq = 0.0f;
-    half* out_kmse_ptr = out_kmse + row_id * D + lane_in_row * 8;
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
         float k_mse_val = r[i] * m_base * d_row[i];
-        out_kmse_ptr[i] = __float2half(k_mse_val);
         float diff = orig[i] - k_mse_val;
         r[i] = diff * d_row[i]; 
         res_sum_sq += diff * diff;

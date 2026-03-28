@@ -504,9 +504,9 @@ class KudahitamCompressorHBBA:
             score = torch.matmul(q_proj, compressed["quantized"].half().transpose(-2, -1))
             return score * compressed["norms"].unsqueeze(-2)
             
-        indices = compressed["indices"].to(dev); signs_packed = compressed["signs"].to(dev)
-        # Reconstruct Base Cache on-the-fly (VRAM Savings)
-        k_mse = self.centroids_table[indices.long()]
+        indices = compressed["indices"].to(dev); signs_packed = compressed["signs"].to(dev); norms = compressed["norms"].to(dev)
+        # Reconstruct Base Cache on-the-fly (V8.9.1 Scaled Sync)
+        k_mse = self.centroids_table[indices.long()] * norms.unsqueeze(-1) * (1.0 / self.head_dim)
         # Unpack 1-bit signs (V8.8.0 Bit-Stream Engine)
         signs = (((signs_packed.unsqueeze(-1) >> torch.arange(8, device=dev)) & 1).half() * 2 - 1)
         signs = signs.view(queries.shape[:-2] + (-1, self.head_dim)) # (B, H, S, D)
