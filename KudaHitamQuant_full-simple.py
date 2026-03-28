@@ -82,10 +82,10 @@ def load_cuda_ext():
         os.makedirs(build_dir, exist_ok=True)
         
         try:
-            print(f"[KudaHitam] Starting JIT Compilation (Mode: Gila Mode V4)...")
+            print(f"[KudaHitam] Starting JIT Compilation (Mode: Gila Mode V7.5 Full Fusion)...")
             _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir)
             CUDA_EXT_AVAILABLE = True
-            print("[KudaHitam] [✓] ULTRA-GILA MODE ACTIVE: Warp-Only Register FWHT (V4) fully loaded.")
+            print("[KudaHitam] [✓] ULTRA-GILA MODE ACTIVE: Monolithic Full Fusion (V7.5) fully loaded.")
         except Exception as e:
             print(f"[KudaHitam] [X] JIT Compilation failed! Error detail:\n{str(e)}")
             print("[KudaHitam] Falling back to Triton/PyTorch engine.")
@@ -222,8 +222,8 @@ class KudahitamCompressorV2:
         # Priority: Ultra-Gila Mode (Ultra-Fused: Norm + Scale + FWHT + Quant)
         cuda_ext = load_cuda_ext()
         if CUDA_EXT_AVAILABLE and cuda_ext and states.is_cuda:
-            indices, vec_norms = cuda_ext.ultra_fused_compress(flat.contiguous(), self.d.float().contiguous(), self.centroids.to(dev).float().contiguous())
-            k_mse = cuda_ext.ultra_fused_reconstruct(indices, vec_norms, self.centroids.to(dev).float().contiguous(), self.d.float().contiguous())
+            # Priority: Ultra-Gila Mode (Monolithic V7.5)
+            indices, vec_norms, k_mse = cuda_ext.ultra_fused_full_fusion(flat.contiguous(), self.d.float().contiguous(), self.centroids.to(dev).float().contiguous())
         else:
             # Fallback to standard Gila Mode or Triton/PyTorch
             vec_norms = torch.norm(flat, dim=-1, keepdim=True)
