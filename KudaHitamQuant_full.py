@@ -500,7 +500,7 @@ class KudahitamCompressorHBBA:
         # Reconstruct Base Cache on-the-fly (V8.9.4 Dimension-Robust Gather)
         B, H, S, D = indices.shape
         k_mse = self.centroids_table.gather(1, indices.long().reshape(-1, D).T).T.reshape(B, H, S, D)
-        k_mse = k_mse * norms.unsqueeze(-1) * (1.0 / self.head_dim)
+        k_mse = (k_mse * norms.unsqueeze(-1) * (1.0 / self.head_dim)).half()
         # Unpack 1-bit signs (V8.8.0 Bit-Stream Engine)
         signs = (((signs_packed.unsqueeze(-1) >> torch.arange(8, device=dev)) & 1).half() * 2 - 1)
         signs = signs.view(queries.shape[:-2] + (-1, self.head_dim)) # (B, H, S, D)
