@@ -155,11 +155,13 @@ if TRITON_AVAILABLE:
 def fwht(x: torch.Tensor):
     if not x.is_cuda: return fwht_pytorch(x)
         
-    cuda_ext = load_cuda_ext()
-    if CUDA_EXT_AVAILABLE and cuda_ext:
-        orig_shape = x.shape
-        x = x.reshape(-1, x.shape[-1]).contiguous()
-        cuda_ext.forward(x)
+    if not hasattr(fwht, '_kernel'):
+        cuda_ext = load_cuda_ext()
+        fwht._kernel = cuda_ext.forward if (CUDA_EXT_AVAILABLE and cuda_ext) else None
+
+    if fwht._kernel:
+        orig_shape = x.shape; x = x.reshape(-1, x.shape[-1]).contiguous()
+        fwht._kernel(x)
         return x.reshape(orig_shape)
         
     # Priority 2: Bitwise-Optimized Triton (Blocked)
@@ -220,10 +222,14 @@ class KudahitamCompressorV2:
         dev = states.device; shape = [int(v) for v in states.shape]; flat = states.reshape(-1, shape[-1]).half()
         
         # Priority: Ultra-Gila Mode (Ultra-Fused: Norm + Scale + FWHT + Quant)
-        cuda_ext = load_cuda_ext()
-        if CUDA_EXT_AVAILABLE and cuda_ext and flat.is_cuda:
-            # Priority: Ultra-Gila Mode (Monolithic V7.6 Native FP16)
-            indices, vec_norms, k_mse = cuda_ext.ultra_fused_full_fusion(flat.contiguous(), self.d.float().contiguous(), self.centroids.to(dev).float().contiguous())
+        # Priority: Ultra-Gila Mode (Ultra-Fused: V7.6.1 Direct Dispatch)
+        if not hasattr(self, '_cuda_kernel'):
+            cuda_ext = load_cuda_ext()
+            self._cuda_kernel = cuda_ext.ultra_fused_full_fusion if (CUDA_EXT_AVAILABLE and cuda_ext) else None
+            
+        if self._cuda_kernel and flat.is_cuda:
+            # Native FP16 No-Alloc Direct Path
+            indices, vec_norms, k_mse = self._cuda_kernel(flat.contiguous(), self.d.half().contiguous(), self.centroids.to(dev).half().contiguous())
         else:
             vec_norms = torch.norm(flat, dim=-1, keepdim=True)
             rotated = fwht((flat.float() / (vec_norms + 1e-8)) * self.d)

@@ -210,14 +210,14 @@ def fwht(x: torch.Tensor):
             fwht._notified = True
         return fwht_pytorch(x)
         
-    cuda_ext = load_cuda_ext()
-    if CUDA_EXT_AVAILABLE and cuda_ext:
-        if not hasattr(fwht, '_notified'):
-            print("[KudaHitam] [✓] FWHT: Using Hardware-Optimized CUDA Kernel.")
-            fwht._notified = True
-        orig_shape = x.shape
-        x = x.reshape(-1, x.shape[-1]).contiguous()
-        cuda_ext.forward(x)
+    if not hasattr(fwht, '_kernel'):
+        cuda_ext = load_cuda_ext()
+        fwht._kernel = cuda_ext.forward if (CUDA_EXT_AVAILABLE and cuda_ext) else None
+        if fwht._kernel: print("[KudaHitam] [✓] FWHT: Using Hardware-Optimized CUDA Kernel."); fwht._notified = True
+
+    if fwht._kernel:
+        orig_shape = x.shape; x = x.reshape(-1, x.shape[-1]).contiguous()
+        fwht._kernel(x)
         return x.reshape(orig_shape)
         
     # Priority 2: Bitwise-Optimized Triton (Blocked)
@@ -351,10 +351,14 @@ class KudahitamCompressorV2:
             else: flat_q[:, self.protected_indices] = 0.0
         else: p_indices = p_norms = None; flat_q = flat
             
-        # Priority: Ultra-Gila Mode (Ultra-Fused: Monolithic V7.5)
-        cuda_ext = load_cuda_ext()
-        if CUDA_EXT_AVAILABLE and cuda_ext and flat.is_cuda and not self.use_fractional and not self.use_dynamic_codebook:
-            indices, vec_norms, k_mse = cuda_ext.ultra_fused_full_fusion(flat.contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
+        # Priority: Ultra-Gila Mode (Ultra-Fused: V7.6.1 Direct Dispatch)
+        if not hasattr(self, '_cuda_kernel'):
+            cuda_ext = load_cuda_ext()
+            self._cuda_kernel = cuda_ext.ultra_fused_full_fusion if (CUDA_EXT_AVAILABLE and cuda_ext) else None
+            
+        if self._cuda_kernel and flat.is_cuda and not self.use_fractional and not self.use_dynamic_codebook:
+            # Native FP16 No-Alloc Direct Path
+            indices, vec_norms, k_mse = self._cuda_kernel(flat.contiguous(), self.d.half().contiguous(), self.centroids.half().contiguous())
         else:
             # Fallback to standard Gila Mode or Triton/PyTorch
             vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)
