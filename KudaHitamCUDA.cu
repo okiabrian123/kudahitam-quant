@@ -270,13 +270,19 @@ __global__ void fwht_cuda_forward_kernel(float* __restrict__ x, int D, int N) {
 }
 
 void fwht_cuda_forward(torch::Tensor x) {
-    const int N = x.size(0);
-    const int D = x.size(1);
-    at::cuda::CUDAGuard device_guard(x.device());
+    auto x_float = x.to(torch::kFloat32); // Safe fallback for legacy FWHT kernel
+    const int N = x_float.size(0);
+    const int D = x_float.size(1);
+    at::cuda::CUDAGuard device_guard(x_float.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     dim3 threads(256);
     dim3 blocks((N * D + 2047) / 2048); 
-    fwht_cuda_forward_kernel<<<blocks, threads, 0, stream>>>(x.data_ptr<float>(), D, N);
+    fwht_cuda_forward_kernel<<<blocks, threads, 0, stream>>>(x_float.data_ptr<float>(), D, N);
+    
+    // Copy back result if it was half (since it's in-place)
+    if (x.scalar_type() == torch::kHalf) {
+        x.copy_(x_float);
+    }
 }
 
 __global__ void ultra_fused_hbba_fusion_kernel(
