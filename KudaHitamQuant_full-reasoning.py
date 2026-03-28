@@ -565,8 +565,8 @@ def main():
 
             # Strategies: (Name, Bits, Outlier_Idxs, Use_Outlier, Outlier_P, Outlier_Bits, Frac_Idxs)
             strategies = [
-                ("1-bit (V2)", 1, [], False, 0, 4, []),
-                ("2-bit (V2)", 2, [], False, 0, 4, []),
+                ("1-bit (V1)", 1, [], False, 0, 4, []),
+                ("2-bit (V1)", 2, [], False, 0, 4, []),
                 ("1.16-bit (V2)", 1.75, [], False, 0, 0, [])
             ]
 
