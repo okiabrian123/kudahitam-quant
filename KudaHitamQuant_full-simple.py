@@ -250,15 +250,25 @@ class KudahitamCompressorHBBA:
         variances = sample_rotated.var(0); num_4bit = int(D * self.hbba_4bit_ratio)
         top_indices = torch.topk(variances, num_4bit).indices
         self.n_centroids_map = torch.full((D,), 2, dtype=torch.int32, device=dev); self.n_centroids_map[top_indices] = 16
-        self.centroids_table = torch.zeros((D, 16), device=dev)
-        for i in range(D):
-            n_c = int(self.n_centroids_map[i]); data = sample_rotated[:, i]; c = torch.linspace(data.min(), data.max(), n_c, device=dev)
-            for _ in range(10): 
-                dist = (data.unsqueeze(-1) - c).abs(); idx = dist.argmin(-1)
-                for k in range(n_c):
-                    mask = (idx == k)
-                    if mask.any(): c[k] = data[mask].mean()
-            self.centroids_table[i, :n_c] = c
+        min_v = sample_rotated.min(0, keepdim=True).values.T; max_v = sample_rotated.max(0, keepdim=True).values.T
+        c_16 = min_v + torch.linspace(0, 1, 16, device=dev).unsqueeze(0) * (max_v - min_v)
+        c_2  = min_v + torch.linspace(0, 1, 2, device=dev).unsqueeze(0) * (max_v - min_v)
+        
+        c = torch.zeros((D, 16), device=dev, dtype=torch.float32)
+        m_16 = (self.n_centroids_map == 16); m_2 = (self.n_centroids_map == 2)
+        c[m_16, :] = c_16[m_16, :]; c[m_2, :2] = c_2[m_2, :]
+        
+        data = sample_rotated.unsqueeze(2)
+        valid_mask = torch.arange(16, device=dev).unsqueeze(0) < self.n_centroids_map.unsqueeze(1)
+        
+        for _ in range(10):
+            dist = (data - c.unsqueeze(0)).abs()
+            dist = torch.where(valid_mask.unsqueeze(0), dist, torch.tensor(1e9, device=dev, dtype=dist.dtype))
+            idx_onehot = torch.nn.functional.one_hot(dist.argmin(-1), num_classes=16).float()
+            count = idx_onehot.sum(0)
+            c = torch.where(count > 0, (idx_onehot * data).sum(0) / count, c)
+            
+        self.centroids_table = c
         self.is_calibrated = True
 
     @torch.no_grad()
