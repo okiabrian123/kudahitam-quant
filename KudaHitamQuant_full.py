@@ -33,88 +33,73 @@ try:
 except ImportError:
     TRITON_AVAILABLE = False
 
-# --- GILA MODE: RAW CUDA JIT BRIDGE (LAZY) ---
-_KudaHitamCUDA = None
-CUDA_EXT_AVAILABLE = False
-_CUDA_BUILD_ATTEMPTED = False
-_CENTROID_CACHE = {}
-
-def load_cuda_ext():
-    global _KudaHitamCUDA, CUDA_EXT_AVAILABLE, _CUDA_BUILD_ATTEMPTED
-    if _CUDA_BUILD_ATTEMPTED: return _KudaHitamCUDA
-    _CUDA_BUILD_ATTEMPTED = True
-    try:
-        from torch.utils.cpp_extension import load
-        import os, subprocess
-        def find_nvcc():
-            try:
-                subprocess.check_output(["nvcc", "--version"])
-                return True
-            except:
-                for p in ["/usr/local/cuda/bin", "/usr/local/cuda-12.8/bin", "/usr/local/cuda-12.1/bin", "/usr/local/cuda-11.8/bin"]:
-                    if os.path.exists(os.path.join(p, "nvcc")):
-                        os.environ["PATH"] += ":" + p
-                        return True
-            return False
-
-        current_dir = os.getcwd()
-        try: current_dir = os.path.dirname(os.path.abspath(__file__))
-        except NameError: pass
-        
-        _src = os.path.join(current_dir, "KudaHitamCUDA.cu")
-        if os.path.exists(_src) and find_nvcc():
-            build_dir = os.path.join(current_dir, "cuda_build")
-            os.makedirs(build_dir, exist_ok=True)
-            try:
-                _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=True, with_cuda=True, build_directory=build_dir)
-                CUDA_EXT_AVAILABLE = True
-                print("[KudaHitam] Gila Mode V3 Activated: Raw CUDA Warp-Shuffles Enabled.")
-            except Exception as e:
-                try: 
-                    _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=True, with_cuda=True, build_directory=build_dir, is_python_module=True)
-                    CUDA_EXT_AVAILABLE = True
-                    print("[KudaHitam] Gila Mode V3 Activated: Raw CUDA Warp-Shuffles Enabled.")
-                except Exception as e2:
-                    print(f"[KudaHitam] CUDA Compile Failed! Falling back to Triton. Errors:\n1. {e}\n2. {e2}")
-        else:
-            print(f"[KudaHitam] CUDA source not found or NVCC missing. src exist: {os.path.exists(_src)}, nvcc found: {find_nvcc()}")
-        return _KudaHitamCUDA
-    except Exception as e_out:
-        print(f"[KudaHitam] Unexpected error during CUDA load: {e_out}")
-        return None
-
 # --- PURE TRITON KERNELS ---
 
 if TRITON_AVAILABLE:
     @triton.jit
-    def fwht_blocked_kernel(x_ptr, y_ptr, n_rows, stride_x, D: tl.constexpr, BLOCK_ROWS: tl.constexpr):
-        """Amortized Ultra-Fast Zero-Transpose Bitwise FWHT."""
+    def fwht_kernel(x_ptr, y_ptr, n_rows, stride_x, D: tl.constexpr):
+        """Single-pass shared-memory FWHT (Orthonormal & Fast)."""
         pid = tl.program_id(0)
-        row_base = pid * BLOCK_ROWS
+        block_start = pid * stride_x
+        
+        # Load entire row (D=256) into shared memory
         offs = tl.arange(0, D)
+        sdata = tl.load(x_ptr + block_start + offs).to(tl.float32)
         
-        # Precompute masks to avoid constexpr[0] indexing bug
-        m0 = tl.reshape(tl.where(tl.arange(0, 2) == 0, 1.0, 0.0), [1, 2, 1])
-        m1 = tl.reshape(tl.where(tl.arange(0, 2) == 1, 1.0, 0.0), [1, 2, 1])
+        # Butterfly stages (Vectorized with masking to avoid indexing errors)
+        # We unroll manually to ensure each stage has constant shapes for tl.reshape
         
-        for k in range(BLOCK_ROWS):
-            row_idx = row_base + k
-            if row_idx < n_rows:
-                ptr = x_ptr + row_idx * stride_x + offs
-                x = tl.load(ptr).to(tl.float32)
-                
-                # Zero-Transpose Butterfly (Unrolled Sylvester) - Masked Sum Approach
-                t = tl.reshape(x, [128, 2, 1]); a = tl.sum(t * m0, 1); b = tl.sum(t * m1, 1); x = tl.reshape(tl.join(a + b, a - b), [256])
-                t = tl.reshape(x, [64, 2, 2]); a = tl.sum(t * m0, 1); b = tl.sum(t * m1, 1); x = tl.reshape(tl.join(a + b, a - b), [256])
-                t = tl.reshape(x, [32, 2, 4]); a = tl.sum(t * m0, 1); b = tl.sum(t * m1, 1); x = tl.reshape(tl.join(a + b, a - b), [256])
-                t = tl.reshape(x, [16, 2, 8]); a = tl.sum(t * m0, 1); b = tl.sum(t * m1, 1); x = tl.reshape(tl.join(a + b, a - b), [256])
-                t = tl.reshape(x, [8, 2, 16]); a = tl.sum(t * m0, 1); b = tl.sum(t * m1, 1); x = tl.reshape(tl.join(a + b, a - b), [256])
-                t = tl.reshape(x, [4, 2, 32]); a = tl.sum(t * m0, 1); b = tl.sum(t * m1, 1); x = tl.reshape(tl.join(a + b, a - b), [256])
-                t = tl.reshape(x, [2, 2, 64]); a = tl.sum(t * m0, 1); b = tl.sum(t * m1, 1); x = tl.reshape(tl.join(a + b, a - b), [256])
-                t = tl.reshape(x, [1, 2, 128]); a = tl.sum(t * m0, 1); b = tl.sum(t * m1, 1); x = tl.reshape(tl.join(a + b, a - b), [256])
-                
-                scale = 1.0 / 16.0 # sqrt(256)
-                tl.store(y_ptr + row_idx * stride_x + offs, (x * scale).to(x_ptr.dtype.element_ty))
+        # Stage 0: h=1
+        s3d = tl.reshape(sdata, [128, 2, 1])
+        u = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 0, s3d, 0.0), axis=1, keep_dims=True), [128, 2, 1])
+        v = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 1, s3d, 0.0), axis=1, keep_dims=True), [128, 2, 1])
+        sdata = tl.reshape(tl.where(tl.arange(0, 2)[None, :, None] == 0, u + v, u - v), [256])
+        
+        # Stage 1: h=2
+        s3d = tl.reshape(sdata, [64, 2, 2])
+        u = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 0, s3d, 0.0), axis=1, keep_dims=True), [64, 2, 2])
+        v = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 1, s3d, 0.0), axis=1, keep_dims=True), [64, 2, 2])
+        sdata = tl.reshape(tl.where(tl.arange(0, 2)[None, :, None] == 0, u + v, u - v), [256])
+        
+        # Stage 2: h=4
+        s3d = tl.reshape(sdata, [32, 2, 4])
+        u = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 0, s3d, 0.0), axis=1, keep_dims=True), [32, 2, 4])
+        v = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 1, s3d, 0.0), axis=1, keep_dims=True), [32, 2, 4])
+        sdata = tl.reshape(tl.where(tl.arange(0, 2)[None, :, None] == 0, u + v, u - v), [256])
+        
+        # Stage 3: h=8
+        s3d = tl.reshape(sdata, [16, 2, 8])
+        u = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 0, s3d, 0.0), axis=1, keep_dims=True), [16, 2, 8])
+        v = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 1, s3d, 0.0), axis=1, keep_dims=True), [16, 2, 8])
+        sdata = tl.reshape(tl.where(tl.arange(0, 2)[None, :, None] == 0, u + v, u - v), [256])
+        
+        # Stage 4: h=16
+        s3d = tl.reshape(sdata, [8, 2, 16])
+        u = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 0, s3d, 0.0), axis=1, keep_dims=True), [8, 2, 16])
+        v = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 1, s3d, 0.0), axis=1, keep_dims=True), [8, 2, 16])
+        sdata = tl.reshape(tl.where(tl.arange(0, 2)[None, :, None] == 0, u + v, u - v), [256])
+        
+        # Stage 5: h=32
+        s3d = tl.reshape(sdata, [4, 2, 32])
+        u = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 0, s3d, 0.0), axis=1, keep_dims=True), [4, 2, 32])
+        v = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 1, s3d, 0.0), axis=1, keep_dims=True), [4, 2, 32])
+        sdata = tl.reshape(tl.where(tl.arange(0, 2)[None, :, None] == 0, u + v, u - v), [256])
+        
+        # Stage 6: h=64
+        s3d = tl.reshape(sdata, [2, 2, 64])
+        u = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 0, s3d, 0.0), axis=1, keep_dims=True), [2, 2, 64])
+        v = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 1, s3d, 0.0), axis=1, keep_dims=True), [2, 2, 64])
+        sdata = tl.reshape(tl.where(tl.arange(0, 2)[None, :, None] == 0, u + v, u - v), [256])
+        
+        # Stage 7: h=128
+        s3d = tl.reshape(sdata, [1, 2, 128])
+        u = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 0, s3d, 0.0), axis=1, keep_dims=True), [1, 2, 128])
+        v = tl.broadcast_to(tl.sum(tl.where(tl.arange(0, 2)[None, :, None] == 1, s3d, 0.0), axis=1, keep_dims=True), [1, 2, 128])
+        sdata = tl.reshape(tl.where(tl.arange(0, 2)[None, :, None] == 0, u + v, u - v), [256])
+
+        # Normalize to orthonormal (1/sqrt(D))
+        scale = 1.0 / tl.sqrt(float(D))
+        tl.store(y_ptr + block_start + offs, (sdata * scale).to(x_ptr.dtype.element_ty))
 
     @triton.jit
     def quantize_kernel_pure(
@@ -191,24 +176,14 @@ if TRITON_AVAILABLE:
 # --- WRAPPER FUNCTIONS ---
 
 def fwht(x: torch.Tensor):
-    if not x.is_cuda: return fwht_pytorch(x)
-    cuda_ext = load_cuda_ext()
-    if CUDA_EXT_AVAILABLE and cuda_ext:
-        orig_shape = x.shape
-        x = x.reshape(-1, x.shape[-1]).contiguous()
-        cuda_ext.forward(x)
-        return x.reshape(orig_shape)
-        
-    # Priority 2: Bitwise-Optimized Triton (Blocked)
-    if not TRITON_AVAILABLE: return fwht_pytorch(x)
+    if not TRITON_AVAILABLE or not x.is_cuda: return fwht_pytorch(x)
     orig_shape = x.shape
     x = x.reshape(-1, x.shape[-1]).contiguous(); D = x.shape[-1]
-    if (D & (D - 1)) != 0: return fwht_pytorch(x)
+    if (D & (D - 1)) != 0: return fwht_pytorch(x) # Fallback if not power-of-2
     y = torch.empty_like(x)
     with torch.cuda.device(x.device):
-        BLOCK_ROWS = 64
-        grid = (triton.cdiv(x.shape[0], BLOCK_ROWS),)
-        fwht_blocked_kernel[grid](x, y, x.shape[0], x.stride(0), D=D, BLOCK_ROWS=BLOCK_ROWS)
+        grid = (x.shape[0],)
+        fwht_kernel[grid](x, y, x.shape[0], x.stride(0), D=D)
     return y.reshape(orig_shape)
 
 def fwht_pytorch(x: torch.Tensor):
@@ -235,29 +210,18 @@ class KudahitamCompressorV2:
                  use_spectral: bool = False, use_vwh: bool = False, use_dynamic_codebook: bool = False, use_fractional: bool = False, use_ultra: bool = False):
         self.head_dim = head_dim; self.bits = bits; self.device = device; self.outlier_threshold = outlier_threshold; self.protected_dim_count = protected_dim_count; self.protected_indices = None
         self.is_domain_layer = is_domain_layer; self.use_outlier = use_outlier; self.domain_p_count = domain_p_count; self.p_bits = p_bits; self.use_spaced = use_spaced; self.use_spectral = use_spectral; self.use_vwh = use_vwh; self.use_dynamic_codebook = use_dynamic_codebook; self.use_fractional = use_fractional; self.use_ultra = use_ultra
-        
-        # Consistent Rademacher Vector (D) regardless of cache
         gen = torch.Generator(device="cpu").manual_seed(seed)
         self.d = torch.sign(torch.randn(head_dim, generator=gen)).to(device)
-
-        # Optimized Centroid Logic: Use Global Cache to prevent "Lelet" initialization
-        cache_key = (bits, head_dim)
-        if cache_key in _CENTROID_CACHE:
-            self.centroids = _CENTROID_CACHE[cache_key].to(device)
-        else:
-            from scipy import integrate; n_levels = 1 << bits; sigma = 1.0 / math.sqrt(head_dim)
-            def pdf(x): return (1.0 / math.sqrt(2 * math.pi * sigma ** 2)) * math.exp(-x * x / (2 * sigma ** 2))
-            lo, hi = -3.5 * sigma, 3.5 * sigma
-            centroids = [lo + (hi - lo) * (i + 0.5) / n_levels for i in range(n_levels)]
-            for _ in range(200):
-                boundaries = [(centroids[i] + centroids[i+1]) / 2.0 for i in range(n_levels - 1)]; edges = [lo * 3] + boundaries + [hi * 3]; new_c = []
-                for i in range(n_levels): a, b = edges[i], edges[i+1]; num, _ = integrate.quad(lambda x: x*pdf(x), a, b); den, _ = integrate.quad(pdf, a, b); new_c.append(num / den if den > 1e-15 else centroids[i])
-                if max(abs(new_c[i] - centroids[i]) for i in range(n_levels)) < 1e-10: break
-                centroids = new_c
-            self.centroids = torch.tensor(centroids, dtype=torch.float32).to(device)
-            _CENTROID_CACHE[cache_key] = self.centroids.cpu()
-
-        # Walsh-Sequency indices...
+        from scipy import integrate; n_levels = 1 << bits; sigma = 1.0 / math.sqrt(head_dim)
+        def pdf(x): return (1.0 / math.sqrt(2 * math.pi * sigma ** 2)) * math.exp(-x * x / (2 * sigma ** 2))
+        lo, hi = -3.5 * sigma, 3.5 * sigma
+        centroids = [lo + (hi - lo) * (i + 0.5) / n_levels for i in range(n_levels)]
+        for _ in range(200):
+            boundaries = [(centroids[i] + centroids[i+1]) / 2.0 for i in range(n_levels - 1)]; edges = [lo * 3] + boundaries + [hi * 3]; new_c = []
+            for i in range(n_levels): a, b = edges[i], edges[i+1]; num, _ = integrate.quad(lambda x: x*pdf(x), a, b); den, _ = integrate.quad(pdf, a, b); new_c.append(num / den if den > 1e-15 else centroids[i])
+            if max(abs(new_c[i] - centroids[i]) for i in range(n_levels)) < 1e-10: break
+            centroids = new_c
+        self.centroids = torch.tensor(centroids, dtype=torch.float32).to(device)
         # Recursive QJL for protection (Mini-Turbo)
         self.p_centroids = None; self.p_Pi = None; self.p_norms = None
         # Walsh-Sequency ordering for Spectral JPEG
@@ -311,30 +275,34 @@ class KudahitamCompressorV2:
             else: flat_q[:, self.protected_indices] = 0.0
         else: p_indices = p_norms = None; flat_q = flat
             
-        # Priority: Gila Mode V3 (Semi-Fused: FWHT + Quantization + Inline Scaling)
-        vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)
-        cuda_ext = load_cuda_ext()
-        if CUDA_EXT_AVAILABLE and cuda_ext and flat_q.is_cuda and not self.use_fractional and not self.use_dynamic_codebook:
-            indices = cuda_ext.fused_compress(flat_q.float().contiguous(), vec_norms.float().contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
-            k_mse = fwht(self.centroids[indices.long()]) * self.d * vec_norms
-        else:
-            # Fallback to Triton/PyTorch
-            rotated = fwht((flat_q.float() / (vec_norms + 1e-8)) * self.d)
-            if self.use_dynamic_codebook:
-                _a = rotated.abs().mean(); centroids = torch.tensor([-_a, _a], device=dev)
-            else: centroids = self.centroids
-            
-            if self.use_fractional:
-                split_at = 64 if self.use_ultra else 128
-                _sigma = rotated.abs().mean() / 0.79788
-                c_h = 0.9816 * _sigma; c2 = torch.tensor([-c_h, 0.0, c_h], device=dev)
+        vec_norms = torch.norm(flat_q, dim=-1, keepdim=True); rotated = fwht((flat_q.float() / (vec_norms + 1e-8)) * self.d)
+        _a = rotated.abs().mean(); _sigma = _a / 0.79788
+        if self.use_dynamic_codebook: centroids = torch.tensor([-_a, _a], device=dev)
+        else: centroids = self.centroids
+        
+        if self.use_fractional:
+            split_at = 64 if self.use_ultra else 128
+            c_h = 0.9816 * _sigma; c2 = torch.tensor([-c_h, 0.0, c_h], device=dev)
+            if TRITON_AVAILABLE and rotated.is_cuda:
+                with torch.cuda.device(dev):
+                    i_tmp = torch.empty_like(rotated, dtype=torch.int32).contiguous()
+                    grid = (triton.cdiv(rotated.numel(), 1024),)
+                    fractional_quantize_kernel[grid](rotated.contiguous(), c2.contiguous(), centroids.contiguous(), i_tmp, rotated.numel(), rotated.shape[1], split_at, len(c2), len(centroids), BLOCK_SIZE=1024)
+                    indices = i_tmp.to(torch.uint8)
+            else:
                 idx0 = (rotated[:, :split_at].unsqueeze(-1) - c2).abs().argmin(-1).to(torch.uint8)
                 idx1 = (rotated[:, split_at:].unsqueeze(-1) - centroids).abs().argmin(-1).to(torch.uint8)
                 indices = torch.cat([idx0, idx1], dim=-1)
-                k_mse = fwht(torch.cat([c2[indices[:, :split_at].long()], centroids[indices[:, split_at:].long()]], dim=-1)) * self.d * vec_norms
-            else:
-                indices = (rotated.unsqueeze(-1) - centroids).abs().argmin(-1).to(torch.uint8)
-                k_mse = fwht(centroids[indices.long()]) * self.d * vec_norms
+            k_mse = fwht(torch.cat([c2[indices[:, :split_at].long()], centroids[indices[:, split_at:].long()]], dim=-1)) * self.d * vec_norms
+        else:
+            indices = torch.empty_like(rotated, dtype=torch.uint8)
+            if TRITON_AVAILABLE and rotated.is_cuda:
+                with torch.cuda.device(dev):
+                    i_tmp = torch.empty_like(rotated, dtype=torch.int32).contiguous()
+                    grid = (triton.cdiv(rotated.numel(), 1024),); quantize_kernel_pure[grid](rotated.contiguous(), centroids.contiguous(), i_tmp, rotated.numel(), len(centroids), BLOCK_SIZE=1024)
+                    indices = i_tmp.to(torch.uint8)
+            else: indices = (rotated.unsqueeze(-1) - centroids).abs().argmin(-1).to(torch.uint8)
+            k_mse = fwht(centroids[indices.long()]) * self.d * vec_norms
             
         if self.use_vwh: k_mse = k_mse / self.vwh_weights
         residual = flat_q - k_mse; r_norm = torch.norm(residual, dim=-1); projected = fwht(residual * self.d); signs = (projected >= 0).to(torch.int8) * 2 - 1
@@ -377,17 +345,15 @@ class KudahitamCompressorGaussian:
     def compress(self, states: torch.Tensor, offload: bool = True) -> dict:
         if isinstance(states, (list, tuple)): states = states[0]
         dev = states.device; shape = [int(v) for v in states.shape]; flat = states.reshape(-1, shape[-1]).float()
-        if self.Pi.device != dev: self.Pi = self.Pi.to(dev)
-        if self.centroids.device != dev: self.centroids = self.centroids.to(dev)
         if self.protected_dim_count > 0:
             if self.protected_indices is None: v_dims = flat.var(0); self.protected_indices = torch.topk(v_dims, self.protected_dim_count).indices
             p_vals = flat[:, self.protected_indices].to(torch.float16); flat_q = flat.clone(); flat_q[:, self.protected_indices] = 0.0
         else: p_vals = None; flat_q = flat
             
         vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)
-        rotated = (flat_q / (vec_norms + 1e-8)) @ self.Pi.T
-        indices = (rotated.unsqueeze(-1) - self.centroids).abs().argmin(-1).to(torch.uint8)
-        k_mse = (self.centroids[indices.long()] @ self.Pi) * vec_norms
+        rotated = (flat_q / (vec_norms + 1e-8)) @ self.Pi.to(dev).T
+        indices = (rotated.unsqueeze(-1) - self.centroids.to(dev)).abs().argmin(-1).to(torch.uint8)
+        k_mse = (self.centroids.to(dev)[indices.long()] @ self.Pi.to(dev)) * vec_norms
         return { "indices": indices, "norms": vec_norms.squeeze(-1).to(torch.float16), "p_vals": p_vals, "p_idx": self.protected_indices, "rank": len(shape), "shape": tuple(shape), "k_mse": k_mse.to(torch.float16).reshape(shape) }
 
     @torch.no_grad()
@@ -437,21 +403,13 @@ def main():
     print("-" * 150); print(f"{'Ctx':7s} | {'Field':10s} | {'Strategy/Bit Mode':34s} | {'Acc (V2/F)':12s} | {'Acc (G)':12s} | {'Comp(F)':8s} | {'Mem'}")
     for ctx in [10000, 40000]:
         for task_name, task_desc in benchmark_tasks:
-            # Diverse filler for realistic context
-            fillers = [
-                "The KudaHitam engine utilizes a structured projection matrix for KV-cache compression.",
-                "Fast Walsh-Hadamard Transforms (FWHT) offer O(D log D) complexity which is ideal for LLMs.",
-                "Spectral quantization methods focus on the frequency domain properties of the hidden states.",
-                "QJL theory suggests that random projections can preserve distances with high probability.",
-                "Implementing custom Triton kernels allows for fused operations and reduced VRAM bandwidth usage.",
-                "Context windows in modern transformers are limited by the quadratic cost of attention.",
-                "Activation outliers are a known challenge for low-bit weight and activation quantization.",
-                "Softmax attention requires high precision to maintain mathematical properties of the distribution."
-            ]
-            filler_text = " ".join(fillers * (ctx // 200 + 1))
             messages = [{"role": "user", "content": task_desc}]
-            input_text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
-            in_ids = tok(input_text + " | Research: " + filler_text, return_tensors="pt", truncation=True, max_length=ctx).input_ids.to(model.device); pkv = None
+            try:
+                input_text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
+            except:
+                input_text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            
+            in_ids = tok(input_text + " | Context Block: " * (ctx // 50), return_tensors="pt").input_ids.to(model.device); pkv = None
             with torch.no_grad():
                 for i in range(0, in_ids.shape[1], 2048): out = model(in_ids[:, i:i+2048], past_key_values=pkv, use_cache=True); pkv = out.past_key_values
             gpu_c = []
@@ -541,43 +499,17 @@ def main():
                             p_count_g = curr_p_dim if (is_d and use_out) else (16 if use_out else 0)
                             comp = CompClass(D, b_count, seed=l_idx, device=model.device, protected_dim_count=p_count_g)
                             
-                        torch.cuda.synchronize(); t0 = time.perf_counter(); c = comp.compress(keys, offload=False); torch.cuda.synchronize(); comp_l.append(time.perf_counter() - t0); s = comp.asymmetric_attention_scores(q, c); cos_l.append(F.cosine_similarity(real.flatten(), s.flatten(), dim=0))
-                    res_row[ver] = {"acc": (torch.stack(cos_l).mean().item()), "ms": (sum(comp_l)/len(comp_l))*1000}
+                        torch.cuda.synchronize(); t0 = time.perf_counter(); c = comp.compress(keys, offload=False); torch.cuda.synchronize(); comp_l.append(time.perf_counter() - t0); s = comp.asymmetric_attention_scores(q, c); cos_l.append(F.cosine_similarity(real.flatten(), s.flatten(), dim=0).item())
+                    res_row[ver] = {"acc": sum(cos_l)/len(cos_l), "ms": (sum(comp_l)/len(comp_l))*1000}
                 print(f"Done: {ctx} | {task_name} | {s_name}")
-                main.all_results.append((ctx, task_name, s_name, res_row['V2']['acc'], res_row['Gaussian']['acc'], res_row['V2']['ms'], res_row['Gaussian']['ms'], mem_total))
-
-    # --- SAMPLE GENERATION (TESTING OUTPUT QUALITY) ---
-    print("\n" + "=" * 165)
-    print("DEMONSTRATING OUTPUT QUALITY (REASONING TASK @ 10K CONTEXT, V2 SPECTRAL 2-BIT)")
-    print("=" * 165)
-    try:
-        sample_task = benchmark_tasks[0][1] # Seating arrangement
-        messages = [{"role": "user", "content": sample_task}]
-        input_text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
-        in_ids = tok(input_text + " | Research: " + filler_text[:2000], return_tensors="pt").input_ids.to(model.device)
-        pkv = None
-        with torch.no_grad():
-            for i in range(0, in_ids.shape[1], 2048): out = model(in_ids[:, i:i+2048], past_key_values=pkv, use_cache=True); pkv = out.past_key_values
-        # Compress KV Cache for generation
-        comp = KudahitamCompressorV2(256, 2, seed=0, device=str(model.device)); new_pkv = []
-        for l_idx, keys in enumerate(pkv.key_cache):
-            if keys is None: new_pkv.append(None); continue
-            c = comp.compress(keys[0] if isinstance(keys, (list, tuple)) else keys, offload=False)
-            new_pkv.append((comp.asymmetric_attention_scores(torch.zeros(1,1,1,256).to(model.device), c), None)) # Mock
-        
-        # Simple generation check (just to show it works)
-        print(f"Prompt: {sample_task[:100]}...")
-        print(f"Compressed Output: [Generating with spectral quantization...]")
-        # Note: Dynamic generation with compressed KV requires custom attention hooks. 
-        # For this benchmark, we've verified the Cosine Similarity indicates output sanity.
-    except Exception as e: print(f"Generation skip: {e}")
+                main.all_results.append((ctx, task_name, s_name, res_row['V2']['acc'], res_row['Gaussian']['acc'], res_row['V2']['ms'], mem_total))
 
     # --- FINAL CONSOLIDATED DISPLAY ---
-    print("\n" + "=" * 165)
-    print(f"{'Ctx':7s} | {'Field':10s} | {'Strategy/Bit Mode':34s} | {'Acc (V2/F)':12s} | {'Acc (G)':12s} | {'Comp(V2)':8s} | {'Comp(G)':8s} | {'Mem'}")
-    print("-" * 165)
+    print("\n" + "=" * 150)
+    print(f"{'Ctx':7s} | {'Field':10s} | {'Strategy/Bit Mode':34s} | {'Acc (V2/F)':12s} | {'Acc (G)':12s} | {'Comp(F)':8s} | {'Mem'}")
+    print("-" * 150)
     for r in main.all_results:
-        print(f"{r[0]:5d} | {r[1]:10s} | {r[2]:34s} | {r[3]:.4f}     | {r[4]:.4f}     | {r[5]:8.2f} | {r[6]:8.2f} | {int(r[7]):7d}")
-    print("=" * 165)
+        print(f"{r[0]:5d} | {r[1]:10s} | {r[2]:34s} | {r[3]:.4f}     | {r[4]:.4f}     | {r[5]:8.2f} | {int(r[6]):7d}")
+    print("=" * 150)
 if __name__ == "__main__":
     main()

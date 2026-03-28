@@ -66,12 +66,12 @@ def load_cuda_ext():
             build_dir = os.path.join(current_dir, "cuda_build")
             os.makedirs(build_dir, exist_ok=True)
             try:
-                _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=True, with_cuda=True, build_directory=build_dir)
+                _KudaHitamCUDA = load(name="KudaHitamCUDA_v3_final", sources=[_src], verbose=True, with_cuda=True, build_directory=build_dir)
                 CUDA_EXT_AVAILABLE = True
                 print("[KudaHitam] Gila Mode V3 Activated: Raw CUDA Warp-Shuffles Enabled.")
             except Exception as e:
                 try: 
-                    _KudaHitamCUDA = load(name="KudaHitamCUDA", sources=[_src], verbose=True, with_cuda=True, build_directory=build_dir, is_python_module=True)
+                    _KudaHitamCUDA = load(name="KudaHitamCUDA_v3_final", sources=[_src], verbose=True, with_cuda=True, build_directory=build_dir, is_python_module=True)
                     CUDA_EXT_AVAILABLE = True
                     print("[KudaHitam] Gila Mode V3 Activated: Raw CUDA Warp-Shuffles Enabled.")
                 except Exception as e2:
