@@ -355,7 +355,7 @@ __global__ void ultra_fused_hbba_fusion_kernel(
 
     // Parallel load centroids to SRAM
     for (int i = threadIdx.x; i < D * 16; i += threads_per_row) {
-        s_centroids[i / 16][i % 16] = (half)centroids_table[i];
+        s_centroids[i / 16][i % 16] = __float2half(centroids_table[i]);
     }
     for (int i = threadIdx.x; i < D; i += threads_per_row) {
         s_n_c[i] = n_centroids_map[i];
@@ -372,11 +372,11 @@ __global__ void ultra_fused_hbba_fusion_kernel(
         float projected = r[k] * f_scale;
         uint8_t best_c = 0; float min_dist = 1e18f;
         for(int c = 0; c < n_centroids; ++c) {
-            float dist = fabsf(projected - (float)s_centroids[element_idx][c]);
+            float dist = fabsf(projected - __half2float(s_centroids[element_idx][c]));
             if (dist < min_dist) { min_dist = dist; best_c = (uint8_t)c; }
         }
         out_idx[row_id * D + element_idx] = best_c;
-        r[k] = (float)s_centroids[element_idx][best_c]; 
+        r[k] = __half2float(s_centroids[element_idx][best_c]); 
     }
 
     // Pass 2: FWHT (Reconstruct)
