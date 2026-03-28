@@ -5,43 +5,15 @@
 #include <ATen/cuda/CUDAContext.h>
 
 /**
- * KudaHitam FWHT - Gila Mode V7.6 (Native FP16 Engine)
- * Monolithic: FP16 Input -> Registers -> Quant -> Reconstruction -> FP16 Output
- * Formula: Out = FWHT(LloydMax(FWHT(X_norm * D), centroids)) * D * ||X||
- * Bypasses Python-level FP16->FP32 casting floor.
+ * KudaHitam FWHT - Gila Mode V8.3 (Final Handover)
+ * Monolithic: FP16 Input -> Registers -> Quant -> Reconstruction -> FP32 Output
+ * [V8.0] Fused Indices, Norms, k_mse, Signs, and Residual Norms.
+ * [V8.1] Fixed Scaling parity with Triton hardcoded 1/16.
+ * [V8.2] Sign-bit accuracy correction for D=128 (D/256 factor).
+ * [V8.3] Professional annotation and final stabilization.
  */
 
-__device__ __forceinline__ void fwht_butterfly_warp(float r[8], int lane_id) {
-    #pragma unroll
-    for(int step = 1; step <= 2; step <<= 1) {
-        #pragma unroll
-        for(int i = 0; i <= 4; i += 4) {
-            #pragma unroll
-            for(int j = 0; j < 4; ++j) {
-                if ((j & step) == 0) {
-                    float a = r[i + j]; float b = r[i + (j | step)];
-                    r[i + j] = a + b; r[i + (j | step)] = a - b;
-                }
-            }
-        }
-    }
-    #pragma unroll
-    for(int t_step = 1; t_step <= 16; t_step <<= 1) {
-        #pragma unroll
-        for(int k = 0; k < 8; ++k) {
-            float other = __shfl_xor_sync(0xffffffff, r[k], t_step);
-            if ((lane_id & t_step) == 0) r[k] = r[k] + other;
-            else r[k] = other - r[k];
-        }
-    }
-    #pragma unroll
-    for(int j = 0; j < 4; ++j) {
-        float a = r[j]; float b = r[j + 4];
-        r[j] = a + b; r[j + 4] = a - b;
-    }
-}
-
-__global__ void ultra_fused_full_fusion_kernel_v8(
+__global__ void ultra_fused_full_fusion_kernel_v83(
     const half* __restrict__ x, 
     const float* __restrict__ d, 
     const float* __restrict__ centroids, 
@@ -57,8 +29,7 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
     if (row_id >= N) return;
 
     int lane_id = threadIdx.x & 31;
-    int elements_per_row = D;
-    int threads_per_row = elements_per_row / 8; 
+    int threads_per_row = D / 8; 
     int row_start_lane = (lane_id / threads_per_row) * threads_per_row;
     int lane_in_row = lane_id % threads_per_row;
 
@@ -66,7 +37,7 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
     float sum_sq = 0.0f;
     
     // 1. Vectorized FP16 Load
-    const half2* x_ptr = reinterpret_cast<const half2*>(x) + row_id * (elements_per_row/2) + lane_in_row * 4;
+    const half2* x_ptr = reinterpret_cast<const half2*>(x) + row_id * (D/2) + lane_in_row * 4;
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         half2 val2 = x_ptr[i];
@@ -83,13 +54,11 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
     if (lane_in_row == 0) out_norms[row_id] = norm;
     
     // 3. Forward Projection
-    {
-        const float* d_row = d + lane_in_row * 8;
-        #pragma unroll
-        for(int k=0; k<8; ++k) r[k] = (r[k] * d_row[k]) / norm;
-    }
+    const float* d_row = d + lane_in_row * 8;
+    #pragma unroll
+    for(int k=0; k<8; ++k) r[k] = (r[k] * d_row[k]) / norm;
 
-    // 4. In-Kernel Butterfly (Dynamic)
+    // 4. Butterfly Transform
     #pragma unroll
     for(int step = 1; step <= 2; step <<= 1) {
         #pragma unroll
@@ -114,9 +83,9 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
     #pragma unroll
     for(int j = 0; j < 4; ++j) { float a = r[j]; float b = r[j + 4]; r[j] = a + b; r[j + 4] = a - b; }
 
-    // 5. Quantize & Sign & Residual Norm Extraction
-    float f_scale = 1.0f / 16.0f; // Matching Triton/Baseline Hardcoded Scale
-    float s_factor = (float)D / 256.0f; // Correction for Double-FWHT Scaling in signs
+    // 5. Quantize & Sign Extraction [V8.3]
+    float f_scale = 1.0f / 16.0f; // [V8.1] Aligned to Triton
+    float s_factor = (float)D / 256.0f; // [V8.2] Sign Correction Factor
     uint8_t out_c[8];
     float sum_sq_resid = 0.0f;
     #pragma unroll
@@ -128,7 +97,7 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
             if (dist < min_dist) { min_dist = dist; best_c = (uint8_t)c; }
         }
         out_c[k] = best_c;
-        float resid = projected - s_factor * centroids[best_c];
+        float resid = projected - s_factor * centroids[best_c]; // [V8.3] Sign bit logic
         sum_sq_resid += (projected - centroids[best_c]) * (projected - centroids[best_c]);
         if (out_signs != nullptr) out_signs[row_id * D + lane_in_row * 8 + k] = (resid >= 0) ? 1 : -1;
         r[k] = centroids[best_c]; 
@@ -175,10 +144,8 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
     for(int j = 0; j < 4; ++j) { float a = r[j]; float b = r[j + 4]; r[j] = a + b; r[j + 4] = a - b; }
 
     // 8. Reconstruct & Write FP32
-    float b_scale = 1.0f / 16.0f; // Inverse Scaling
-    float m_base = b_scale * norm;
+    float m_base = (1.0f / 16.0f) * norm; 
     float* out_ptr = out_kmse + row_id * D + lane_in_row * 8;
-    const float* d_row = d + lane_in_row * 8;
     #pragma unroll
     for (int i = 0; i < 8; ++i) out_ptr[i] = r[i] * m_base * d_row[i];
 }
@@ -205,7 +172,7 @@ std::vector<torch::Tensor> ultra_fused_full_fusion_cuda(
     dim3 threads(256);
     dim3 blocks((N * D + 2047) / 2048);
 
-    ultra_fused_full_fusion_kernel_v8<<<blocks, threads, 0, stream>>>(
+    ultra_fused_full_fusion_kernel_v83<<<blocks, threads, 0, stream>>>(
         (const half*)x.data_ptr<at::Half>(), 
         d.data_ptr<float>(), 
         centroids.data_ptr<float>(), 
@@ -219,9 +186,6 @@ std::vector<torch::Tensor> ultra_fused_full_fusion_cuda(
     return {out_idx, out_norms, out_kmse, out_signs, out_r_norms};
 }
 
-void fwht_cuda_forward_warp(torch::Tensor x) { }
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &fwht_cuda_forward_warp, "Reserved");
-    m.def("ultra_fused_full_fusion", &ultra_fused_full_fusion_cuda, "KudaHitam Engine V8.1");
+    m.def("ultra_fused_full_fusion", &ultra_fused_full_fusion_cuda, "KudaHitam Engine V8.3 [FULL FUSION]");
 }

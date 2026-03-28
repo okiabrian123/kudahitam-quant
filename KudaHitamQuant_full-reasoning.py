@@ -82,10 +82,10 @@ def load_cuda_ext():
         os.makedirs(build_dir, exist_ok=True)
         
         try:
-            print(f"[KudaHitam] Starting JIT Compilation (Mode: Gila Mode V8.2 Accuracy Fix)...")
-            _KudaHitamCUDA = load(name="KudaHitamCUDA_V82", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir)
+            print(f"[KudaHitam] Starting JIT Compilation (Mode: Gila Mode V8.3 Final Handover)...")
+            _KudaHitamCUDA = load(name="KudaHitamCUDA_V83", sources=[_src], verbose=False, with_cuda=True, build_directory=build_dir)
             CUDA_EXT_AVAILABLE = True
-            print("[KudaHitam] [✓] GILA MODE V8.2 ACTIVE: Monolithic Accuracy Fix fully loaded.")
+            print("[KudaHitam] [✓] GILA MODE V8.3 ACTIVE: Monolithic Final Engine fully loaded.")
         except Exception as e:
             print(f"[KudaHitam] [X] JIT Compilation failed! Error detail:\n{str(e)}")
             print("[KudaHitam] Falling back to Triton/PyTorch engine.")
@@ -355,7 +355,7 @@ class KudahitamCompressorV2:
         cuda_ext = load_cuda_ext()
         if CUDA_EXT_AVAILABLE and cuda_ext and flat.is_cuda and not self.use_fractional and not self.use_dynamic_codebook:
             indices, vec_norms, k_mse, signs, r_norms = cuda_ext.ultra_fused_full_fusion(flat.contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
-            return {"indices": indices, "norms": vec_norms.squeeze(-1).float(), "k_mse": k_mse.reshape(shape), "signs": signs.reshape(shape), "r_norm": r_norms.float().reshape(shape[:-1])}
+            return {"indices": indices, "norms": vec_norms.squeeze(-1).float(), "k_mse": k_mse.reshape(shape), "signs": signs.reshape(shape), "r_norm": r_norms.float().reshape(shape[:-1])} # [V8.3] Monolithic Return
         else:
             # Fallback to standard Gila Mode or Triton/PyTorch
             vec_norms = torch.norm(flat_q, dim=-1, keepdim=True)
