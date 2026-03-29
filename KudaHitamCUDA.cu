@@ -808,6 +808,9 @@ __global__ void fused_asymmetric_attention_kernel(
         }
         __syncthreads();
     }
+    // SCALE FWHT: Match Python's fwht() orthonormal scale (1/sqrt(D))
+    if (threadIdx.x < D) s_q_proj[threadIdx.x] *= (1.0f / sqrtf((float)D));
+    __syncthreads();
 
     // 3. Scoring (head-specific keys)
     int lane = threadIdx.x % 32;
