@@ -598,10 +598,10 @@ torch::Tensor hbba_calibrate_cuda(torch::Tensor sample, torch::Tensor n_map, int
     return centroids;
 }
 
-// --- Symmetry Nexus (V8.8.2) Component ---
+// --- Symmetry Nexus (V9.4) Component ---
 
 // Fast Rank Calculation using __popc
-__device__ __forceinline__ int get_rank_v2(const uint32_t* mask, int i, int bit_val) {
+__device__ int get_rank_v2(const uint32_t* mask, int i, int bit_val) {
     int idx = i >> 5; int pos = i & 31; int rank = 0;
     #pragma unroll
     for (int j = 0; j < 8; ++j) {
@@ -672,7 +672,7 @@ __global__ void packed_hbba_fusion_kernel(
         out_signs[row * D + i] = __float2half(res);
         kmse += res * res;
 
-        // 3. Grouped Bit-Packing (SRAM) - V8.8.2
+        // 3. Grouped Bit-Packing (SRAM) - V9.4
         int rank = get_rank_v2(hbba_mask, i, is_4bit);
         if (is_4bit) {
             // Group A (Byte 0-31): 2 per byte
@@ -856,7 +856,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ultra_fused_full_fusion", &ultra_fused_full_fusion_cuda, "God Kernel V8.3");
     m.def("ultra_fused_hbba_fusion", &ultra_fused_hbba_fusion_cuda, "HBBA God Kernel V8.5");
     m.def("hbba_calibrate_cuda", &hbba_calibrate_cuda, "Atomic HBBA Calibrator V8.7");
-    m.def("packed_hbba_fusion", &packed_hbba_fusion_cuda, "Symmetry Nexus Encoder V8.8");
-    m.def("asymmetric_score_cuda", &asymmetric_score_cuda, "Symmetry Nexus Scorer V8.8");
+    m.def("packed_hbba_fusion", &packed_hbba_fusion_cuda, "Symmetry Nexus Encoder V9.4");
+    m.def("asymmetric_score_cuda", &asymmetric_score_cuda, "Symmetry Nexus Scorer V9.4");
     m.def("fused_asymmetric_attention", &fused_asymmetric_attention_cuda, "Zero-HBM Fused Attn V9.4");
 }
