@@ -589,9 +589,10 @@ def main():
                             comp = KudahitamCompressorHBBA(D, b_count, seed=l_idx, device=model.device, hbba_4bit_ratio=0.25, layer_id=l_idx, active_mask=L1_ACTIVE_MASK)
                             comp.calibrate(keys) 
                             # Logic: If mask is 0, effective bits = 1.0. If 1, effective = 1.75
-                            b_eff = 1.75 if (L1_ACTIVE_MASK >> l_idx) & 1 else 1.0
-                            l_base = (b_eff * D / 8) + 2
-                            mem_total += l_base * H
+                            if ver == "V2":
+                                b_eff = 1.75 if (L1_ACTIVE_MASK >> l_idx) & 1 else 1.0
+                                l_base = (b_eff * D / 8) + 2
+                                mem_total += l_base * H
                         elif ver == "V2":
                             is_d = (l_idx in d_set); is_f = (l_idx in f_set)
                             comp = CompClass(D, b_count, seed=l_idx, device=model.device, is_domain_layer=is_d, use_outlier=use_out, domain_p_count=(d_p if is_d else 0), p_bits=o_bits)
