@@ -706,12 +706,14 @@ __global__ void fused_asymmetric_attention_packed_kernel(
     int head_id = blockIdx.y;
     if (head_id >= H) return;
 
+    __shared__ float s_q[256];
     __shared__ float s_q_proj[256];
     __shared__ float s_centroids[256][16];
 
     // 1. Shared Load Query, Diag & Centroids
     if (threadIdx.x < D) {
         float q_val = __half2float(q[head_id * D + threadIdx.x]);
+        s_q[threadIdx.x] = q_val;
         s_q_proj[threadIdx.x] = q_val * d_vec[threadIdx.x];
         #pragma unroll
         for(int c=0; c<16; ++c) s_centroids[threadIdx.x][c] = centroids_table[threadIdx.x * 16 + c];
@@ -756,7 +758,7 @@ __global__ void fused_asymmetric_attention_packed_kernel(
         
         float k_recon = s_centroids[i][val] * k_norm;
         sum1 += s_q_proj[i] * k_recon;
-        sum2 += s_q_proj[i] * __half2float(my_signs[i]);
+        sum2 += s_q[i] * __half2float(my_signs[i]);
     }
 
     // Intra-warp reduction
