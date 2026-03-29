@@ -455,11 +455,11 @@ __global__ void ultra_fused_hbba_fusion_kernel(
         r[j] = a + b; r[j + 4] = a - b;
     }
 
-    half* out_half_signs = ((half*)out_signs) + row_id * D + lane_in_row * 8;
+    uint8_t* out_residual_idx = out_signs + row_id * D + lane_in_row * 8;
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        // V10: True 1-bit Residual Sign Extraction
-        out_half_signs[i] = __float2half( (r[i] >= 0.0f) ? 1.0f : -1.0f );
+        // 1-bit Residual Quantization: Store sign bit (0/1)
+        out_residual_idx[i] = (r[i] >= 0) ? 1 : 0;
     }
 }
 
@@ -475,17 +475,15 @@ std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
     
     auto idx_options = torch::TensorOptions().dtype(torch::kUInt8).device(x.device());
     auto norm_options = torch::TensorOptions().dtype(torch::kFloat32).device(x.device());
-    auto sign_options = torch::TensorOptions().dtype(torch::kFloat16).device(x.device());
 
     torch::Tensor out_idx = torch::empty({N, D}, idx_options);
     torch::Tensor out_norms = torch::empty({N, 1}, norm_options);
-    torch::Tensor out_kmse = torch::empty({N, D}, norm_options);
     torch::Tensor out_r_norms = torch::empty({N, 1}, norm_options);
-    torch::Tensor out_signs = torch::empty({N, D}, sign_options);
+    torch::Tensor out_signs = torch::empty({N, D}, idx_options); // 1-bit indices
 
     at::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    dim3 threads(32); // row isolation
+    dim3 threads(32); 
     dim3 blocks(N); 
 
     ultra_fused_hbba_fusion_kernel<<<blocks, threads, 0, stream>>>(
@@ -495,12 +493,12 @@ std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
         (const uint32_t*)mask.data_ptr<int>(),
         out_idx.data_ptr<uint8_t>(), 
         out_norms.data_ptr<float>(), 
-        out_kmse.data_ptr<float>(),
+        nullptr, // k_mse ELIMINATED
         out_r_norms.data_ptr<float>(),
-        (half*)out_signs.data_ptr<at::Half>(),
+        out_signs.data_ptr<uint8_t>(),
         D, N
     );
-    return {out_idx, out_norms, out_kmse, out_r_norms, out_signs};
+    return {out_idx, out_norms, out_r_norms, out_signs};
 }
 
 __global__ void hbba_calibrate_cuda_kernel(
@@ -775,25 +773,30 @@ torch::Tensor asymmetric_score_cuda(
 }
 
 __global__ void fused_asymmetric_attention_kernel(
-    const half* __restrict__ q,       // [H, D]
-    const float* __restrict__ k_mse,   // [H, S, D]
-    const half* __restrict__ signs,   // [H, S, D]
-    const float* __restrict__ d_vec,   // [D]
-    const float* __restrict__ r_norms, // [H, S]
-    float* __restrict__ out_scores,   // [H, S]
+    const half* __restrict__ q,             // [H, D]
+    const uint8_t* __restrict__ indices,    // [H, S, D] (Baseline)
+    const uint8_t* __restrict__ res_indices, // [H, S, D] (Residual Signs 0/1)
+    const float* __restrict__ d_vec,        // [D]
+    const float* __restrict__ norms,        // [H, S] (Baseline Norms)
+    const float* __restrict__ r_norms,      // [H, S] (Residual Norms)
+    const float* __restrict__ centroids,     // [D, 16]
+    const int* __restrict__ hbba_mask,       // [8] (Symmetry Nexus Mask)
+    float* __restrict__ out_scores,         // [H, S]
     int D, int S, int H, float scale) 
 {
     int head_id = blockIdx.y;
-    if (head_id >= H) return; // UNIFORM: Entire block exits correctly
+    if (head_id >= H) return; 
 
-    __shared__ float s_q[256];
     __shared__ float s_q_proj[256];
+    __shared__ float s_centroids[256][16];
 
-    // 1. Shared Load Query & Diag (per head)
+    // 1. Collaborative Load Query & centroids
     if (threadIdx.x < D) {
         float q_val = __half2float(q[head_id * D + threadIdx.x]);
-        s_q[threadIdx.x] = q_val;
-        s_q_proj[threadIdx.x] = q_val * d_vec[threadIdx.x];
+        s_q_proj[threadIdx.x] = q_val * d_vec[threadIdx.x]; // Q * d in SRAM
+    }
+    for (int i = threadIdx.x; i < D * 16; i += blockDim.x) {
+        s_centroids[i / 16][i % 16] = centroids[i];
     }
     __syncthreads();
 
@@ -808,7 +811,7 @@ __global__ void fused_asymmetric_attention_kernel(
         }
         __syncthreads();
     }
-    // SCALE FWHT: Match Python's fwht() orthonormal scale (1/sqrt(D))
+    // Orthonormal scale (1/sqrt(D))
     if (threadIdx.x < D) s_q_proj[threadIdx.x] *= (1.0f / sqrtf((float)D));
     __syncthreads();
 
@@ -819,13 +822,22 @@ __global__ void fused_asymmetric_attention_kernel(
     int lane = threadIdx.x % 32;
     float sum1 = 0; float sum2 = 0;
     
-    const float* my_k_mse = k_mse + (head_id * S + (size_t)row) * D;
-    const half* my_signs = signs + (head_id * S + (size_t)row) * D;
+    const uint8_t* my_indices = indices + (head_id * S + (size_t)row) * D;
+    const uint8_t* my_res_indices = res_indices + (head_id * S + (size_t)row) * D;
+    float my_norm = norms[head_id * S + row];
+    float my_r_norm = r_norms[head_id * S + row];
 
     #pragma unroll
     for (int i = lane; i < D; i += 32) {
-        sum1 += s_q[i] * my_k_mse[i];
-        sum2 += s_q_proj[i] * __half2float(my_signs[i]);
+        uint8_t idx = my_indices[i];
+        uint8_t res_idx = my_res_indices[i];
+        
+        // Term 1: Q_proj @ (Centroids[indices] * Norm) / sqrt(D)
+        sum1 += s_q_proj[i] * s_centroids[i][idx] * my_norm;
+        
+        // Term 2: Q_proj @ (Signs * R_Norm)
+        float signed_res = (res_idx == 1) ? 1.0f : -1.0f;
+        sum2 += s_q_proj[i] * signed_res * my_r_norm;
     }
 
     // Intra-warp reduction
@@ -835,17 +847,19 @@ __global__ void fused_asymmetric_attention_kernel(
     }
 
     if (lane == 0) {
-        out_scores[head_id * S + row] = sum1 + scale * sum2 * r_norms[head_id * S + row];
+        // Final score: (Sum1 / sqrt(D)) + scale * Sum2
+        // scale is 1/sqrt(D) from Python
+        out_scores[head_id * S + row] = (sum1 / sqrtf((float)D)) + scale * sum2;
     }
 }
 
 torch::Tensor fused_asymmetric_attention_cuda(
-    torch::Tensor q, torch::Tensor k_mse, torch::Tensor signs, 
-    torch::Tensor d_vec, torch::Tensor r_norms, float scale) 
+    torch::Tensor q, torch::Tensor indices, torch::Tensor res_indices, 
+    torch::Tensor d_vec, torch::Tensor norms, torch::Tensor r_norms,
+    torch::Tensor centroids, torch::Tensor mask, float scale) 
 {
-    // Shapes: q[H, D], k_mse[H, S, D], signs[H, S, D], r_norms[H, S]
     int H = q.size(0); int D = q.size(1);
-    int S = k_mse.size(1);
+    int S = indices.size(1);
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
     torch::Tensor out_scores = torch::empty({H, S}, options);
 
@@ -855,18 +869,23 @@ torch::Tensor fused_asymmetric_attention_cuda(
     dim3 threads(threads_x);
 
     fused_asymmetric_attention_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (const half*)q.data_ptr<at::Half>(), k_mse.data_ptr<float>(), (const half*)signs.data_ptr<at::Half>(),
-        d_vec.data_ptr<float>(), r_norms.data_ptr<float>(), out_scores.data_ptr<float>(), D, S, H, scale
+        (const half*)q.data_ptr<at::Half>(), 
+        indices.data_ptr<uint8_t>(), 
+        res_indices.data_ptr<uint8_t>(),
+        d_vec.data_ptr<float>(), 
+        norms.data_ptr<float>(),
+        r_norms.data_ptr<float>(), 
+        centroids.data_ptr<float>(),
+        (const int*)mask.data_ptr<int>(),
+        out_scores.data_ptr<float>(), 
+        D, S, H, scale
     );
     return out_scores;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &fwht_cuda_forward, "KudaHitam Forward FWHT");
-    m.def("ultra_fused_full_fusion", &ultra_fused_full_fusion_cuda, "God Kernel V8.3");
-    m.def("ultra_fused_hbba_fusion", &ultra_fused_hbba_fusion_cuda, "HBBA God Kernel V8.5");
+    m.def("ultra_fused_hbba_fusion", &ultra_fused_hbba_fusion_cuda, "Zero-MSE Encoder V10");
     m.def("hbba_calibrate_cuda", &hbba_calibrate_cuda, "Atomic HBBA Calibrator V8.7");
-    m.def("packed_hbba_fusion", &packed_hbba_fusion_cuda, "Symmetry Nexus Encoder V9.4");
-    m.def("asymmetric_score_cuda", &asymmetric_score_cuda, "Symmetry Nexus Scorer V9.4");
-    m.def("fused_asymmetric_attention", &fused_asymmetric_attention_cuda, "Zero-HBM Fused Attn V9.4");
+    m.def("fused_asymmetric_attention", &fused_asymmetric_attention_cuda, "Zero-MSE Fused Scorer V10");
 }
