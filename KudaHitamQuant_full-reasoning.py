@@ -485,18 +485,20 @@ class KudahitamCompressorHBBA:
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:
         dev = queries.device; head_dim = self.head_dim; D = head_dim
-        k_mse = compressed["k_mse"].reshape(-1, D).contiguous().float()
-        signs = compressed["signs"].reshape(-1, D).contiguous().half()
-        r_norm = compressed["r_norm"].reshape(-1).contiguous().float()
-        scale = 1.0 / math.sqrt(head_dim); cuda_ext = load_cuda_ext()
+        k_mse = compressed["k_mse"].float(); signs = compressed["signs"].half(); r_norm = compressed["r_norm"].float()
+        q_shape = queries.shape; B, H, _, _ = q_shape; S = k_mse.shape[-2]
         
-        q_shape = queries.shape; q_flat = queries.view(-1, D).half().contiguous()
-        if q_flat.shape[0] == 1:
-            out = cuda_ext.fused_asymmetric_attention(q_flat[0], k_mse, signs, self.d.to(dev).float(), r_norm, scale)
-            return out.view(*q_shape[:-1], -1)
-        else:
-            res = [cuda_ext.fused_asymmetric_attention(q_flat[h], k_mse, signs, self.d.to(dev).float(), r_norm, scale) for h in range(q_flat.shape[0])]
-            return torch.stack(res).view(*q_shape[:-1], -1)
+        # Reshape everything to head-wise [Batch*Head, S, D]
+        q_flat = queries.view(B*H, D).half().contiguous()
+        k_flat = k_mse.view(B*H, S, D).contiguous()
+        s_flat = signs.view(B*H, S, D).contiguous()
+        r_flat = r_norm.view(B*H, S).contiguous()
+        
+        scale = 1.0 / math.sqrt(head_dim); cuda_ext = load_cuda_ext(); d_vec = self.d.to(dev).float().contiguous()
+        
+        # Each query head only scores against ITS OWN keys
+        res = [cuda_ext.fused_asymmetric_attention(q_flat[h], k_flat[h], s_flat[h], d_vec, r_flat[h], scale) for h in range(B*H)]
+        return torch.stack(res).view(*q_shape[:-1], S)
 
 
 # =============================================================================
