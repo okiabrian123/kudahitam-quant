@@ -84,7 +84,11 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
         r[j] = a + b; r[j + 4] = a - b;
     }
 
-    // 5. Quantize - Orthonormal Scaling
+    // 5. Quantize - Shared Centroid Cache (V9.3)
+    __shared__ float s_centroids[16];
+    if (threadIdx.x < n_centroids) s_centroids[threadIdx.x] = centroids[threadIdx.x];
+    __syncthreads();
+
     float f_scale = 1.0f / sqrtf((float)D);
     uint8_t out_c[8];
     #pragma unroll
@@ -92,11 +96,11 @@ __global__ void ultra_fused_full_fusion_kernel_v8(
         float projected = r[k] * f_scale;
         uint8_t best_c = 0; float min_dist = 1e18f;
         for(int c = 0; c < n_centroids; ++c) {
-            float dist = fabsf(projected - centroids[c]);
+            float dist = fabsf(projected - s_centroids[c]);
             if (dist < min_dist) { min_dist = dist; best_c = (uint8_t)c; }
         }
         out_c[k] = best_c;
-        r[k] = centroids[best_c]; 
+        r[k] = s_centroids[best_c]; 
     }
     
     if (out_idx != nullptr) {
@@ -352,8 +356,8 @@ __global__ void ultra_fused_hbba_fusion_kernel(
 
     __shared__ half s_centroids[256][16];
 
-    // Parallel load centroids to SRAM
-    for (int i = threadIdx.x; i < D * 16; i += threads_per_row) {
+    // Parallel load centroids to SRAM (V9.3: Block-wide parallel load)
+    for (int i = threadIdx.x; i < D * 16; i += blockDim.x) {
         s_centroids[i / 16][i % 16] = __float2half(centroids_table[i]);
     }
     __syncthreads();
@@ -702,6 +706,14 @@ __global__ void asymmetric_score_kernel(
     float* __restrict__ out_scores,   // [N]
     int D, int N) 
 {
+    __shared__ float s_centroids[256][16];
+    
+    // Parallel load centroids to SRAM (V9.3)
+    for (int i = threadIdx.x; i < D * 16; i += blockDim.x) {
+        s_centroids[i / 16][i % 16] = centroids[i];
+    }
+    __syncthreads();
+
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= N) return;
 
@@ -720,7 +732,7 @@ __global__ void asymmetric_score_kernel(
             int byte_idx = 32 + (rank >> 3);
             val = (my_k[byte_idx] >> (rank & 7)) & 0x1;
         }
-        score += __half2float(q[i]) * centroids[i * 16 + val] * norm;
+        score += __half2float(q[i]) * s_centroids[i][val] * norm;
     }
     out_scores[row] = score;
 }
