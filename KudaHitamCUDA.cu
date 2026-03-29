@@ -783,8 +783,7 @@ __global__ void fused_asymmetric_attention_kernel(
     int D, int S, int H, float scale) 
 {
     int head_id = blockIdx.y;
-    int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
-    if (row >= S || head_id >= H) return;
+    if (head_id >= H) return; // UNIFORM: Entire block exits correctly
 
     __shared__ float s_q[256];
     __shared__ float s_q_proj[256];
@@ -813,11 +812,14 @@ __global__ void fused_asymmetric_attention_kernel(
     __syncthreads();
 
     // 3. Scoring (head-specific keys)
+    int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    if (row >= S) return; 
+
     int lane = threadIdx.x % 32;
     float sum1 = 0; float sum2 = 0;
     
-    const float* my_k_mse = k_mse + (head_id * S + row) * D;
-    const half* my_signs = signs + (head_id * S + row) * D;
+    const float* my_k_mse = k_mse + (head_id * S + (size_t)row) * D;
+    const half* my_signs = signs + (head_id * S + (size_t)row) * D;
 
     #pragma unroll
     for (int i = lane; i < D; i += 32) {
