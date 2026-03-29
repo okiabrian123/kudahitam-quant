@@ -484,11 +484,19 @@ class KudahitamCompressorHBBA:
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:
-        dev = queries.device; k_mse = compressed["k_mse"].to(dev).float(); signs = compressed["signs"].to(dev).float(); r_norm = compressed["r_norm"].to(dev).float()
-        term1 = torch.matmul(queries.float(), k_mse.transpose(-2, -1))
-        q_proj = fwht(queries.float() * self.d.to(dev)); qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1))
-        scale = 1.0 / math.sqrt(self.head_dim); out = term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
-        return out
+        dev = queries.device; head_dim = self.head_dim; D = head_dim
+        k_mse = compressed["k_mse"].reshape(-1, D).contiguous().float()
+        signs = compressed["signs"].reshape(-1, D).contiguous().half()
+        r_norm = compressed["r_norm"].reshape(-1).contiguous().float()
+        scale = 1.0 / math.sqrt(head_dim); cuda_ext = load_cuda_ext()
+        
+        q_shape = queries.shape; q_flat = queries.view(-1, D).half().contiguous()
+        if q_flat.shape[0] == 1:
+            out = cuda_ext.fused_asymmetric_attention(q_flat[0], k_mse, signs, self.d.to(dev).float(), r_norm, scale)
+            return out.view(*q_shape[:-1], -1)
+        else:
+            res = [cuda_ext.fused_asymmetric_attention(q_flat[h], k_mse, signs, self.d.to(dev).float(), r_norm, scale) for h in range(q_flat.shape[0])]
+            return torch.stack(res).view(*q_shape[:-1], -1)
 
 
 # =============================================================================

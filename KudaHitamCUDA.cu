@@ -774,6 +774,84 @@ torch::Tensor asymmetric_score_cuda(
     return out_scores;
 }
 
+__global__ void fused_asymmetric_attention_kernel(
+    const half* __restrict__ q,       // [D]
+    const float* __restrict__ k_mse,   // [N, D]
+    const half* __restrict__ signs,   // [N, D]
+    const float* __restrict__ d_vec,   // [D]
+    const float* __restrict__ r_norms, // [N]
+    float* __restrict__ out_scores,   // [N]
+    int D, int N, float scale) 
+{
+    __shared__ float s_q[256];
+    __shared__ float s_q_proj[256];
+
+    // 1. Shared Load Query & Diag
+    if (threadIdx.x < D) {
+        float q_val = __half2float(q[threadIdx.x]);
+        s_q[threadIdx.x] = q_val;
+        s_q_proj[threadIdx.x] = q_val * d_vec[threadIdx.x];
+    }
+    __syncthreads();
+
+    // 2. In-SRAM FWHT for Query Projection
+    for (int len = 1; len < D; len <<= 1) {
+        for (int i = threadIdx.x; i < D; i += blockDim.x) {
+            int step = i / len;
+            if (step % 2 == 0) {
+                float a = s_q_proj[i]; float b = s_q_proj[i + len];
+                s_q_proj[i] = a + b; s_q_proj[i + len] = a - b;
+            }
+        }
+        __syncthreads();
+    }
+
+    // 3. Grid-wide scoring
+    int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    if (row >= N) return;
+
+    int lane = threadIdx.x % 32;
+    float sum1 = 0; float sum2 = 0;
+    
+    const float* my_k_mse = k_mse + row * D;
+    const half* my_signs = signs + row * D;
+
+    #pragma unroll
+    for (int i = lane; i < D; i += 32) {
+        sum1 += s_q[i] * my_k_mse[i];
+        sum2 += s_q_proj[i] * __half2float(my_signs[i]);
+    }
+
+    // Intra-warp reduction
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum1 += __shfl_xor_sync(0xffffffff, sum1, offset);
+        sum2 += __shfl_xor_sync(0xffffffff, sum2, offset);
+    }
+
+    if (lane == 0) {
+        out_scores[row] = sum1 + scale * sum2 * r_norms[row];
+    }
+}
+
+torch::Tensor fused_asymmetric_attention_cuda(
+    torch::Tensor q, torch::Tensor k_mse, torch::Tensor signs, 
+    torch::Tensor d_vec, torch::Tensor r_norms, float scale) 
+{
+    int N = k_mse.size(0); int D = k_mse.size(1);
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
+    torch::Tensor out_scores = torch::empty({N}, options);
+
+    at::cuda::CUDAGuard device_guard(q.device());
+    int threads = 256; 
+    int blocks = (N + (threads / 32) - 1) / (threads / 32);
+
+    fused_asymmetric_attention_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        (const half*)q.data_ptr<at::Half>(), k_mse.data_ptr<float>(), (const half*)signs.data_ptr<at::Half>(),
+        d_vec.data_ptr<float>(), r_norms.data_ptr<float>(), out_scores.data_ptr<float>(), D, N, scale
+    );
+    return out_scores;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &fwht_cuda_forward, "KudaHitam Forward FWHT");
     m.def("ultra_fused_full_fusion", &ultra_fused_full_fusion_cuda, "God Kernel V8.3");
@@ -781,4 +859,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("hbba_calibrate_cuda", &hbba_calibrate_cuda, "Atomic HBBA Calibrator V8.7");
     m.def("packed_hbba_fusion", &packed_hbba_fusion_cuda, "Symmetry Nexus Encoder V8.8");
     m.def("asymmetric_score_cuda", &asymmetric_score_cuda, "Symmetry Nexus Scorer V8.8");
+    m.def("fused_asymmetric_attention", &fused_asymmetric_attention_cuda, "Zero-HBM Fused Attn V9.4");
 }
