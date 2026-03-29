@@ -478,26 +478,45 @@ class KudahitamCompressorHBBA:
         dev = states.device; shape = states.shape; flat = states.reshape(-1, shape[-1]).half()
         cuda_ext = load_cuda_ext()
         if not self.is_calibrated: self.calibrate(states)
-        # Call with layer_id and active_mask
-        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.hbba_mask, self.layer_id, self.active_mask)
-        return { "indices": indices, "norms": vec_norms.squeeze(-1), "k_mse": k_mse.view(shape), "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]), "signs": signs.view(shape), "shape": tuple(shape) }
+        
+        # V10.0: God-Tier Efficiency (Zero-Materialization Encoder)
+        # Returns: {packed_indices(uint8), norms(float32), r_norms(float32), signs(half)}
+        indices_packed, vec_norms, r_norms, signs = cuda_ext.ultra_fused_hbba_fusion(
+            flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, 
+            self.hbba_mask, self.layer_id, self.active_mask)
+            
+        return { 
+            "indices": indices_packed, 
+            "norms": vec_norms.squeeze(-1), 
+            "r_norms": r_norms, 
+            "signs": signs.view(shape), 
+            "shape": tuple(shape) 
+        }
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:
         dev = queries.device; head_dim = self.head_dim; D = head_dim
-        k_mse = compressed["k_mse"].float(); signs = compressed["signs"].half(); r_norm = compressed["r_norm"].float()
-        q_shape = queries.shape; B, H, _, _ = q_shape; S = k_mse.shape[-2]
+        k_packed = compressed["indices"]; k_norms = compressed["norms"].float()
+        signs = compressed["signs"].half(); r_norms = compressed["r_norms"].float()
+        q_shape = queries.shape; B, H, _, _ = q_shape; S = k_norms.shape[-1]
         
-        # Reshape everything to head-wise [Batch*Head, S, D]
+        # Reshape for multi-head Grid-Parallel Scoring
         q_flat = queries.view(B*H, D).half().contiguous()
-        k_flat = k_mse.view(B*H, S, D).contiguous()
+        # Note: indices size depends on HBBA mode [B*H, S, 128 or 32]
+        is_hbba = (self.active_mask >> self.layer_id) & 1
+        bytes_per_token = 128 if is_hbba else 32
+        k_flat = k_packed.view(B*H, S, bytes_per_token).contiguous()
         s_flat = signs.view(B*H, S, D).contiguous()
-        r_flat = r_norm.view(B*H, S).contiguous()
+        n_flat = k_norms.view(B*H, S).contiguous()
+        rn_flat = r_norms.view(B*H, S).contiguous()
         
         scale = 1.0 / math.sqrt(head_dim); cuda_ext = load_cuda_ext(); d_vec = self.d.to(dev).float().contiguous()
         
-        # V9.5: Single-pass Multi-Head CUDA Scoring (The Ultimate Flash-QJL)
-        out = cuda_ext.fused_asymmetric_attention(q_flat, k_flat, s_flat, d_vec, r_flat, scale)
+        # V10.0: Zero-Materialization Scorer (Flash-QJL with SRAM Reconstruction)
+        out = cuda_ext.fused_asymmetric_attention(
+            q_flat, k_flat, s_flat, d_vec, n_flat, rn_flat, 
+            self.centroids_table, self.layer_id, self.active_mask, scale)
+            
         return out.view(*q_shape[:-1], S)
 
 
