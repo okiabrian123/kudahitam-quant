@@ -282,132 +282,6 @@ void fwht_cuda_forward(torch::Tensor x) {
     fwht_cuda_forward_kernel<<<blocks, threads, 0, stream>>>(x.data_ptr<float>(), D, N);
 }
 
-__global__ void ultra_fused_hbba_fusion_kernel(
-    const half* __restrict__ x, 
-    const float* __restrict__ d, 
-    const float* __restrict__ centroids_table, // [D, 16]
-    const uint32_t* __restrict__ hbba_mask,    // [8] (256 bits)
-    uint8_t* __restrict__ out_idx, 
-    float* __restrict__ out_norms, 
-    float* __restrict__ out_kmse,
-    float* __restrict__ out_r_norms,
-    half* __restrict__ out_signs,
-    int D, int N) 
-{
-    int global_thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-    int row_id = (global_thread_id * 8) / D;
-    if (row_id >= N) return;
-
-    int lane_id = threadIdx.x & 31;
-    int threads_per_row = D / 8; 
-    int lane_in_row = lane_id % threads_per_row;
-
-    float r[8];
-    float orig[8];
-    float sum_sq = 0.0f;
-    
-    const half2* x_ptr = reinterpret_cast<const half2*>(x) + row_id * (D/2) + lane_in_row * 4;
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        half2 val2 = x_ptr[i];
-        orig[i*2] = __half2float(val2.x);
-        orig[i*2 + 1] = __half2float(val2.y);
-        sum_sq += orig[i*2]*orig[i*2] + orig[i*2 + 1]*orig[i*2 + 1];
-    }
-
-    for (int offset = threads_per_row >> 1; offset > 0; offset >>= 1) {
-        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset, threads_per_row);
-    }
-    float norm = __shfl_sync(0xffffffff, sum_sq > 0 ? sqrtf(sum_sq) : 1e-8f, 0, threads_per_row);
-    if (lane_in_row == 0) out_norms[row_id] = norm;
-    
-    const float* d_row = d + lane_in_row * 8;
-    #pragma unroll
-    for(int k=0; k<8; ++k) r[k] = (orig[k] * d_row[k]) / norm;
-
-    // Pass 1: FWHT
-    #pragma unroll
-    for(int step = 1; step <= 2; step <<= 1) {
-        #pragma unroll
-        for(int i = 0; i <= 4; i += 4) {
-            #pragma unroll
-            for(int j = 0; j < 4; ++j) {
-                if ((j & step) == 0) {
-                    float a = r[i + j]; float b = r[i + (j | step)];
-                    r[i + j] = a + b; r[i + (j | step)] = a - b;
-                }
-            }
-        }
-    }
-    for(int t_step = 1; t_step < threads_per_row; t_step <<= 1) {
-        #pragma unroll
-        for(int k = 0; k < 8; ++k) {
-            float other = __shfl_xor_sync(0xffffffff, r[k], t_step, threads_per_row);
-            if ((lane_in_row & t_step) == 0) r[k] = r[k] + other;
-            else r[k] = other - r[k];
-        }
-    }
-    #pragma unroll
-    for(int j = 0; j < 4; ++j) {
-        float a = r[j]; float b = r[j + 4];
-        r[j] = a + b; r[j + 4] = a - b;
-    }
-
-    __shared__ half s_centroids[256][16];
-
-    // Parallel load centroids to SRAM (V9.3: Block-wide parallel load)
-    for (int i = threadIdx.x; i < D * 16; i += blockDim.x) {
-        s_centroids[i / 16][i % 16] = __float2half(centroids_table[i]);
-    }
-    __syncthreads();
-
-    // HBBA Quantize
-    float f_scale = 1.0f / sqrtf((float)D);
-    #pragma unroll
-    for(int k = 0; k < 8; ++k) {
-        int element_idx = lane_in_row * 8 + k;
-        // Bit-Mask Lookup (0=1bit, 1=4bit)
-        int is_4bit = (hbba_mask[element_idx >> 5] >> (element_idx & 31)) & 1;
-        int n_centroids = is_4bit ? 16 : 2;
-        
-        float projected = r[k] * f_scale;
-        uint8_t best_c = 0; float min_dist = 1e18f;
-        for(int c = 0; c < n_centroids; ++c) {
-            float dist = fabsf(projected - __half2float(s_centroids[element_idx][c]));
-            if (dist < min_dist) { min_dist = dist; best_c = (uint8_t)c; }
-        }
-        out_idx[row_id * D + element_idx] = best_c;
-        r[k] = __half2float(s_centroids[element_idx][best_c]); 
-    }
-
-    // Pass 2: FWHT (Reconstruct)
-    #pragma unroll
-    for(int step = 1; step <= 2; step <<= 1) {
-        #pragma unroll
-        for(int i = 0; i <= 4; i += 4) {
-            #pragma unroll
-            for(int j = 0; j < 4; ++j) {
-                if ((j & step) == 0) {
-                    float a = r[i + j]; float b = r[i + (j | step)];
-                    r[i + j] = a + b; r[i + (j | step)] = a - b;
-                }
-            }
-        }
-    }
-    for(int t_step = 1; t_step < threads_per_row; t_step <<= 1) {
-        #pragma unroll
-        for(int k = 0; k < 8; ++k) {
-            float other = __shfl_xor_sync(0xffffffff, r[k], t_step, threads_per_row);
-            if ((lane_in_row & t_step) == 0) r[k] = r[k] + other;
-            else r[k] = other - r[k];
-        }
-    }
-    #pragma unroll
-    for(int j = 0; j < 4; ++j) {
-        float a = r[j]; float b = r[j + 4];
-        r[j] = a + b; r[j + 4] = a - b;
-    }
-
 __global__ void ultra_fused_packed_hbba_fusion_kernel(
     const half* __restrict__ x,       // [N, D]
     const float* __restrict__ d_vec,   // [D]
@@ -452,6 +326,7 @@ __global__ void ultra_fused_packed_hbba_fusion_kernel(
     for (int i = threadIdx.x; i < D; i += blockDim.x) s_row[i] = (s_row[i] * inv_norm) * d_vec[i];
     __syncthreads();
 
+    // In-place FWHT (Monolithic V9.6 compliant)
     for (int len = 1; len < D; len <<= 1) {
         for (int i = threadIdx.x; i < D; i += blockDim.x) {
             int step = i / len;
@@ -479,7 +354,7 @@ __global__ void ultra_fused_packed_hbba_fusion_kernel(
         }
         
         // Bit-Packing V10.0
-        if (is_4bit) {
+        if (is_hbba) { // Always use 4-bit layout if layer is HBBA
             int byte_idx = i >> 1; // 2 per byte
             int shift = (i & 1) ? 4 : 0;
             atomicOr((unsigned int*)&s_p[byte_idx & ~3], (unsigned int)((best_c & 0xF) << (shift + (byte_idx & 3) * 8)));
@@ -490,9 +365,7 @@ __global__ void ultra_fused_packed_hbba_fusion_kernel(
         }
 
         // Reconstruct local k to calc residual
-        float k_recon = __half2float(s_centroids[ Best_c = best_c; i]); // Typo? No, wait.
-        // Actually best_c is the index.
-        k_recon = __half2float(s_centroids[i][best_c]);
+        float k_recon = __half2float(s_centroids[i][best_c]);
         float diff = val - k_recon;
         res_sum_sq += diff * diff;
         s_row[i] = diff; // Store residual for Signs pass
