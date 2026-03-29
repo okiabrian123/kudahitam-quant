@@ -381,15 +381,26 @@ class KudahitamCompressorV2:
         dev = queries.device; head_dim = self.head_dim; D = head_dim
         k_packed = compressed["indices"]; k_norms = compressed["norms"].float()
         signs = compressed["signs"].half(); r_norms = compressed["r_norms"].float()
-        q_shape = queries.shape; B, H, _, _ = q_shape; S = k_norms.shape[-1]
         
-        # Reshape for multi-head Grid-Parallel Scoring (V10.2)
-        q_flat = queries.view(B*H, D).half().contiguous()
-        # Non-HBBA uses 32-byte layout (1-bit)
-        k_flat = k_packed.view(B*H, S, 32).contiguous()
-        s_flat = signs.view(B*H, S, D).contiguous()
-        n_flat = k_norms.view(B*H, S).contiguous()
-        rn_flat = r_norms.view(B*H, S).contiguous()
+        q_shape = queries.shape; B, H_q, _, _ = q_shape
+        B_k, H_k, S, _ = compressed["shape"]
+        
+        # Expand KV heads to match Query heads (Grouped Query Attention Support)
+        def expand_kv(t, last_dim=None):
+            if last_dim is not None:
+                t_v = t.view(B_k, H_k, S, last_dim)
+                return t_v.expand(B_k, H_q, S, last_dim).contiguous().view(B_k*H_q, S, last_dim)
+            else:
+                t_v = t.view(B_k, H_k, S)
+                return t_v.expand(B_k, H_q, S).contiguous().view(B_k*H_q, S)
+                
+        # Reshape for multi-head Grid-Parallel Scoring (V10.5)
+        q_flat = queries.view(B_k*H_q, D).half().contiguous()
+        bytes_per_token = k_packed.shape[-1]
+        k_flat = expand_kv(k_packed, bytes_per_token)
+        s_flat = expand_kv(signs, D)
+        n_flat = expand_kv(k_norms)
+        rn_flat = expand_kv(r_norms)
         
         scale = 1.0 / math.sqrt(head_dim); cuda_ext = load_cuda_ext(); d_vec = self.d.to(dev).float().contiguous()
         c_table = torch.zeros((D, 16), dtype=torch.float32, device=dev)
@@ -407,7 +418,8 @@ class KudahitamCompressorV2:
             p_indices = compressed["p_indices"].long(); p_norms = compressed["p_norms"].float().reshape(-1, 1)
             self._init_mini_qjl(len(idx), 0, str(dev), self.p_bits) 
             p_recon = (self.p_centroids[p_indices] @ self.p_Pi) * p_norms
-            k_p = p_recon.view(B_idx, -1, S, len(idx)); q_p = queries[..., idx].float()
+            k_p = p_recon.view(B_idx, H_k, S, len(idx)).expand(B_idx, H_q, S, len(idx))
+            q_p = queries[..., idx].float()
             term3 = torch.matmul(q_p, k_p.transpose(-2, -1)); out += term3
         return out
 
@@ -523,17 +535,27 @@ class KudahitamCompressorHBBA:
         dev = queries.device; head_dim = self.head_dim; D = head_dim
         k_packed = compressed["indices"]; k_norms = compressed["norms"].float()
         signs = compressed["signs"].half(); r_norms = compressed["r_norms"].float()
-        q_shape = queries.shape; B, H, _, _ = q_shape; S = k_norms.shape[-1]
         
+        q_shape = queries.shape; B, H_q, _, _ = q_shape
+        B_k, H_k, S, _ = compressed["shape"]
+        
+        # Expand KV heads to match Query heads (Grouped Query Attention Support)
+        def expand_kv(t, last_dim=None):
+            if last_dim is not None:
+                t_v = t.view(B_k, H_k, S, last_dim)
+                return t_v.expand(B_k, H_q, S, last_dim).contiguous().view(B_k*H_q, S, last_dim)
+            else:
+                t_v = t.view(B_k, H_k, S)
+                return t_v.expand(B_k, H_q, S).contiguous().view(B_k*H_q, S)
+                
         # Reshape for multi-head Grid-Parallel Scoring
-        q_flat = queries.view(B*H, D).half().contiguous()
-        # Note: indices size depends on HBBA mode [B*H, S, 128 or 32]
+        q_flat = queries.view(B_k*H_q, D).half().contiguous()
         is_hbba = (self.active_mask >> self.layer_id) & 1
         bytes_per_token = 128 if is_hbba else 32
-        k_flat = k_packed.view(B*H, S, bytes_per_token).contiguous()
-        s_flat = signs.view(B*H, S, D).contiguous()
-        n_flat = k_norms.view(B*H, S).contiguous()
-        rn_flat = r_norms.view(B*H, S).contiguous()
+        k_flat = expand_kv(k_packed, bytes_per_token)
+        s_flat = expand_kv(signs, D)
+        n_flat = expand_kv(k_norms)
+        rn_flat = expand_kv(r_norms)
         
         scale = 1.0 / math.sqrt(head_dim); cuda_ext = load_cuda_ext(); d_vec = self.d.to(dev).float().contiguous()
         
