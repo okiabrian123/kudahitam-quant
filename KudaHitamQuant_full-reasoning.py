@@ -584,7 +584,7 @@ def main():
                         q = (keys[:, :, -1:, :] if keys.ndim == 4 else keys[:, -1:, :]).float()
                         real = torch.matmul(q, (keys_f := keys.float()).transpose(-2, -1))
                         
-                        if "HBBA" in s_name:
+                        if "1.16-bit" in s_name:
                             # Symmetry Nexus V9.2: Autonomous Layer-Mask Dispatch
                             comp = KudahitamCompressorHBBA(D, b_count, seed=l_idx, device=model.device, hbba_4bit_ratio=0.25, layer_id=l_idx, active_mask=L1_ACTIVE_MASK)
                             comp.calibrate(keys) 
