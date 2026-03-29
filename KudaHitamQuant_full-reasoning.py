@@ -496,9 +496,9 @@ class KudahitamCompressorHBBA:
         
         scale = 1.0 / math.sqrt(head_dim); cuda_ext = load_cuda_ext(); d_vec = self.d.to(dev).float().contiguous()
         
-        # Each query head only scores against ITS OWN keys
-        res = [cuda_ext.fused_asymmetric_attention(q_flat[h], k_flat[h], s_flat[h], d_vec, r_flat[h], scale) for h in range(B*H)]
-        return torch.stack(res).view(*q_shape[:-1], S)
+        # V9.5: Single-pass Multi-Head CUDA Scoring (The Ultimate Flash-QJL)
+        out = cuda_ext.fused_asymmetric_attention(q_flat, k_flat, s_flat, d_vec, r_flat, scale)
+        return out.view(*q_shape[:-1], S)
 
 
 # =============================================================================

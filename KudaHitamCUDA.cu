@@ -774,26 +774,30 @@ torch::Tensor asymmetric_score_cuda(
 }
 
 __global__ void fused_asymmetric_attention_kernel(
-    const half* __restrict__ q,       // [D]
-    const float* __restrict__ k_mse,   // [N, D]
-    const half* __restrict__ signs,   // [N, D]
+    const half* __restrict__ q,       // [H, D]
+    const float* __restrict__ k_mse,   // [H, S, D]
+    const half* __restrict__ signs,   // [H, S, D]
     const float* __restrict__ d_vec,   // [D]
-    const float* __restrict__ r_norms, // [N]
-    float* __restrict__ out_scores,   // [N]
-    int D, int N, float scale) 
+    const float* __restrict__ r_norms, // [H, S]
+    float* __restrict__ out_scores,   // [H, S]
+    int D, int S, int H, float scale) 
 {
+    int head_id = blockIdx.y;
+    int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+    if (row >= S || head_id >= H) return;
+
     __shared__ float s_q[256];
     __shared__ float s_q_proj[256];
 
-    // 1. Shared Load Query & Diag
+    // 1. Shared Load Query & Diag (per head)
     if (threadIdx.x < D) {
-        float q_val = __half2float(q[threadIdx.x]);
+        float q_val = __half2float(q[head_id * D + threadIdx.x]);
         s_q[threadIdx.x] = q_val;
         s_q_proj[threadIdx.x] = q_val * d_vec[threadIdx.x];
     }
     __syncthreads();
 
-    // 2. In-SRAM FWHT for Query Projection
+    // 2. In-SRAM FWHT for Query Projection (per head)
     for (int len = 1; len < D; len <<= 1) {
         for (int i = threadIdx.x; i < D; i += blockDim.x) {
             int step = i / len;
@@ -805,15 +809,12 @@ __global__ void fused_asymmetric_attention_kernel(
         __syncthreads();
     }
 
-    // 3. Grid-wide scoring
-    int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
-    if (row >= N) return;
-
+    // 3. Scoring (head-specific keys)
     int lane = threadIdx.x % 32;
     float sum1 = 0; float sum2 = 0;
     
-    const float* my_k_mse = k_mse + row * D;
-    const half* my_signs = signs + row * D;
+    const float* my_k_mse = k_mse + (head_id * S + row) * D;
+    const half* my_signs = signs + (head_id * S + row) * D;
 
     #pragma unroll
     for (int i = lane; i < D; i += 32) {
@@ -828,7 +829,7 @@ __global__ void fused_asymmetric_attention_kernel(
     }
 
     if (lane == 0) {
-        out_scores[row] = sum1 + scale * sum2 * r_norms[row];
+        out_scores[head_id * S + row] = sum1 + scale * sum2 * r_norms[head_id * S + row];
     }
 }
 
@@ -836,17 +837,20 @@ torch::Tensor fused_asymmetric_attention_cuda(
     torch::Tensor q, torch::Tensor k_mse, torch::Tensor signs, 
     torch::Tensor d_vec, torch::Tensor r_norms, float scale) 
 {
-    int N = k_mse.size(0); int D = k_mse.size(1);
+    // Shapes: q[H, D], k_mse[H, S, D], signs[H, S, D], r_norms[H, S]
+    int H = q.size(0); int D = q.size(1);
+    int S = k_mse.size(1);
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
-    torch::Tensor out_scores = torch::empty({N}, options);
+    torch::Tensor out_scores = torch::empty({H, S}, options);
 
     at::cuda::CUDAGuard device_guard(q.device());
-    int threads = 256; 
-    int blocks = (N + (threads / 32) - 1) / (threads / 32);
+    int threads_x = 256; 
+    dim3 blocks((S + (threads_x / 32) - 1) / (threads_x / 32), H);
+    dim3 threads(threads_x);
 
     fused_asymmetric_attention_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
         (const half*)q.data_ptr<at::Half>(), k_mse.data_ptr<float>(), (const half*)signs.data_ptr<at::Half>(),
-        d_vec.data_ptr<float>(), r_norms.data_ptr<float>(), out_scores.data_ptr<float>(), D, N, scale
+        d_vec.data_ptr<float>(), r_norms.data_ptr<float>(), out_scores.data_ptr<float>(), D, S, H, scale
     );
     return out_scores;
 }
