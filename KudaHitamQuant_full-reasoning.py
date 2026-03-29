@@ -352,74 +352,37 @@ class KudahitamCompressorV2:
             else: flat_q[:, self.protected_indices] = 0.0
         else: p_indices = p_norms = None; flat_q = flat
             
-        # V10.2 God-Tier API Alignment: Zero-Materialization Packed Encoder
-        cuda_ext = load_cuda_ext(); dev = flat_q.device
-        hbba_mask = torch.zeros(8, dtype=torch.int32, device=dev) # All baseline
+        # V8.0 God Kernel: Fused Indices, Norms, K_MSE, R_Norms, and Signs
+        cuda_ext = load_cuda_ext()
+        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_full_fusion(flat_q.contiguous(), self.d.float().contiguous(), self.centroids.float().contiguous())
         
-        # Ensure centroids table is [D, 16] for CUDA
-        c_table = torch.zeros((flat_q.shape[-1], 16), dtype=torch.float32, device=dev)
-        n_c = self.centroids.shape[0]
-        c_table[:, :n_c] = self.centroids.float().to(dev).unsqueeze(0).expand(flat_q.shape[-1], -1)
-
-        indices_packed, vec_norms, r_norms, signs = cuda_ext.ultra_fused_hbba_fusion(
-            flat_q.contiguous().half(), self.d.float().contiguous().to(dev), c_table.contiguous(), 
-            hbba_mask, 0, 0)
-            
         return {
-            "indices": indices_packed,
+            "indices": indices,
             "norms": vec_norms.squeeze(-1),
-            "r_norms": r_norms,
+            "k_mse": k_mse.view(shape),
+            "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]),
             "signs": signs.view(shape),
             "p_indices": p_indices,
             "p_norms": p_norms.squeeze(-1).float() if p_norms is not None else None,
             "p_idx": self.protected_indices,
-            "shape": tuple(shape)
+            "rank": len(shape),
+            "shape": tuple(shape),
+            "is_domain": self.is_domain_layer
         }
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:
-        dev = queries.device; head_dim = self.head_dim; D = head_dim
-        k_packed = compressed["indices"]; k_norms = compressed["norms"].float()
-        signs = compressed["signs"].half(); r_norms = compressed["r_norms"].float()
-        
-        q_shape = queries.shape; B, H_q, _, _ = q_shape
-        B_k, H_k, S, _ = compressed["shape"]
-        
-        # Expand KV heads to match Query heads (Grouped Query Attention Support)
-        def expand_kv(t, last_dim=None):
-            if last_dim is not None:
-                t_v = t.view(B_k, H_k, S, last_dim)
-                return t_v.expand(B_k, H_q, S, last_dim).contiguous().view(B_k*H_q, S, last_dim)
-            else:
-                t_v = t.view(B_k, H_k, S)
-                return t_v.expand(B_k, H_q, S).contiguous().view(B_k*H_q, S)
-                
-        # Reshape for multi-head Grid-Parallel Scoring (V10.5)
-        q_flat = queries.view(B_k*H_q, D).half().contiguous()
-        bytes_per_token = k_packed.shape[-1]
-        k_flat = expand_kv(k_packed, bytes_per_token)
-        s_flat = expand_kv(signs, D)
-        n_flat = expand_kv(k_norms)
-        rn_flat = expand_kv(r_norms)
-        
-        scale = 1.0 / math.sqrt(head_dim); cuda_ext = load_cuda_ext(); d_vec = self.d.to(dev).float().contiguous()
-        c_table = torch.zeros((D, 16), dtype=torch.float32, device=dev)
-        n_c = self.centroids.shape[0]
-        c_table[:, :n_c] = self.centroids.float().to(dev).unsqueeze(0).expand(D, -1)
-        
-        # Zero-Materialization Decoder
-        out = cuda_ext.fused_asymmetric_attention(
-            q_flat, k_flat, s_flat, d_vec, n_flat, rn_flat, c_table.contiguous(), 0, 0, scale)
-            
-        out = out.view(*q_shape[:-1], S)
+        dev = queries.device; k_mse = compressed["k_mse"].to(dev).float(); signs = compressed["signs"].to(dev).float(); r_norm = compressed["r_norm"].to(dev).float()
+        term1 = torch.matmul(queries.float(), k_mse.transpose(-2, -1))
+        q_proj = fwht(queries.float() * self.d); qjl_ip = torch.matmul(q_proj, signs.transpose(-2, -1))
+        scale = 1.0 / math.sqrt(self.head_dim); out = term1 + scale * qjl_ip * r_norm.unsqueeze(-2)
         
         if compressed.get("p_indices") is not None:
-            idx = compressed["p_idx"]; B_idx = compressed["shape"][0]
+            idx = compressed["p_idx"]; B, Sk = compressed["shape"][0], compressed["shape"][-2]
             p_indices = compressed["p_indices"].long(); p_norms = compressed["p_norms"].float().reshape(-1, 1)
-            self._init_mini_qjl(len(idx), 0, str(dev), self.p_bits) 
+            self._init_mini_qjl(len(idx), 0, str(dev), self.p_bits) # Re-initialize p_Pi/p_centroids if needed
             p_recon = (self.p_centroids[p_indices] @ self.p_Pi) * p_norms
-            k_p = p_recon.view(B_idx, H_k, S, len(idx)).expand(B_idx, H_q, S, len(idx))
-            q_p = queries[..., idx].float()
+            k_p = p_recon.view(B, -1, Sk, len(idx)); q_p = queries[..., idx].float()
             term3 = torch.matmul(q_p, k_p.transpose(-2, -1)); out += term3
         return out
 
@@ -515,55 +478,26 @@ class KudahitamCompressorHBBA:
         dev = states.device; shape = states.shape; flat = states.reshape(-1, shape[-1]).half()
         cuda_ext = load_cuda_ext()
         if not self.is_calibrated: self.calibrate(states)
-        
-        # V10.0: God-Tier Efficiency (Zero-Materialization Encoder)
-        # Returns: {packed_indices(uint8), norms(float32), r_norms(float32), signs(half)}
-        indices_packed, vec_norms, r_norms, signs = cuda_ext.ultra_fused_hbba_fusion(
-            flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, 
-            self.hbba_mask, self.layer_id, self.active_mask)
-            
-        return { 
-            "indices": indices_packed, 
-            "norms": vec_norms.squeeze(-1), 
-            "r_norms": r_norms, 
-            "signs": signs.view(shape), 
-            "shape": tuple(shape) 
-        }
+        # Call with layer_id and active_mask
+        indices, vec_norms, k_mse, r_norm, signs = cuda_ext.ultra_fused_hbba_fusion(flat.contiguous(), self.d.to(dev).contiguous(), self.centroids_table, self.hbba_mask, self.layer_id, self.active_mask)
+        return { "indices": indices, "norms": vec_norms.squeeze(-1), "k_mse": k_mse.view(shape), "r_norm": r_norm.squeeze(-1).reshape(shape[:-1]), "signs": signs.view(shape), "shape": tuple(shape) }
 
     @torch.no_grad()
     def asymmetric_attention_scores(self, queries: torch.Tensor, compressed: dict) -> torch.Tensor:
         dev = queries.device; head_dim = self.head_dim; D = head_dim
-        k_packed = compressed["indices"]; k_norms = compressed["norms"].float()
-        signs = compressed["signs"].half(); r_norms = compressed["r_norms"].float()
+        k_mse = compressed["k_mse"].float(); signs = compressed["signs"].half(); r_norm = compressed["r_norm"].float()
+        q_shape = queries.shape; B, H, _, _ = q_shape; S = k_mse.shape[-2]
         
-        q_shape = queries.shape; B, H_q, _, _ = q_shape
-        B_k, H_k, S, _ = compressed["shape"]
-        
-        # Expand KV heads to match Query heads (Grouped Query Attention Support)
-        def expand_kv(t, last_dim=None):
-            if last_dim is not None:
-                t_v = t.view(B_k, H_k, S, last_dim)
-                return t_v.expand(B_k, H_q, S, last_dim).contiguous().view(B_k*H_q, S, last_dim)
-            else:
-                t_v = t.view(B_k, H_k, S)
-                return t_v.expand(B_k, H_q, S).contiguous().view(B_k*H_q, S)
-                
-        # Reshape for multi-head Grid-Parallel Scoring
-        q_flat = queries.view(B_k*H_q, D).half().contiguous()
-        is_hbba = (self.active_mask >> self.layer_id) & 1
-        bytes_per_token = 128 if is_hbba else 32
-        k_flat = expand_kv(k_packed, bytes_per_token)
-        s_flat = expand_kv(signs, D)
-        n_flat = expand_kv(k_norms)
-        rn_flat = expand_kv(r_norms)
+        # Reshape everything to head-wise [Batch*Head, S, D]
+        q_flat = queries.view(B*H, D).half().contiguous()
+        k_flat = k_mse.view(B*H, S, D).contiguous()
+        s_flat = signs.view(B*H, S, D).contiguous()
+        r_flat = r_norm.view(B*H, S).contiguous()
         
         scale = 1.0 / math.sqrt(head_dim); cuda_ext = load_cuda_ext(); d_vec = self.d.to(dev).float().contiguous()
         
-        # V10.0: Zero-Materialization Scorer (Flash-QJL with SRAM Reconstruction)
-        out = cuda_ext.fused_asymmetric_attention(
-            q_flat, k_flat, s_flat, d_vec, n_flat, rn_flat, 
-            self.centroids_table, self.layer_id, self.active_mask, scale)
-            
+        # V9.5: Single-pass Multi-Head CUDA Scoring (The Ultimate Flash-QJL)
+        out = cuda_ext.fused_asymmetric_attention(q_flat, k_flat, s_flat, d_vec, r_flat, scale)
         return out.view(*q_shape[:-1], S)
 
 

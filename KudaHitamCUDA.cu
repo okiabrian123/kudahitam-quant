@@ -282,143 +282,224 @@ void fwht_cuda_forward(torch::Tensor x) {
     fwht_cuda_forward_kernel<<<blocks, threads, 0, stream>>>(x.data_ptr<float>(), D, N);
 }
 
-__global__ void ultra_fused_packed_hbba_fusion_kernel(
-    const half* __restrict__ x,       // [N, D]
-    const float* __restrict__ d_vec,   // [D]
+__global__ void ultra_fused_hbba_fusion_kernel(
+    const half* __restrict__ x, 
+    const float* __restrict__ d, 
     const float* __restrict__ centroids_table, // [D, 16]
-    const uint32_t* __restrict__ hbba_mask,    // [8]
-    uint8_t* __restrict__ out_packed, // [N, 128]
-    float* __restrict__ out_norms,    // [N]
-    float* __restrict__ out_r_norms,  // [N]
-    half* __restrict__ out_signs,     // [N, D]
-    int layer_id, uint8_t active_mask, int D, int N) 
+    const uint32_t* __restrict__ hbba_mask,    // [8] (256 bits)
+    uint8_t* __restrict__ out_idx, 
+    float* __restrict__ out_norms, 
+    float* __restrict__ out_kmse,
+    float* __restrict__ out_r_norms,
+    half* __restrict__ out_signs,
+    int D, int N) 
 {
-    int row = blockIdx.x;
-    if (row >= N) return;
+    int global_thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int row_id = (global_thread_id * 8) / D;
+    if (row_id >= N) return;
 
-    __shared__ float s_row[256];
+    int lane_id = threadIdx.x & 31;
+    int threads_per_row = D / 8; 
+    int lane_in_row = lane_id % threads_per_row;
+
+    float r[8];
+    float orig[8];
+    float sum_sq = 0.0f;
+    
+    const half2* x_ptr = reinterpret_cast<const half2*>(x) + row_id * (D/2) + lane_in_row * 4;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        half2 val2 = x_ptr[i];
+        orig[i*2] = __half2float(val2.x);
+        orig[i*2 + 1] = __half2float(val2.y);
+        sum_sq += orig[i*2]*orig[i*2] + orig[i*2 + 1]*orig[i*2 + 1];
+    }
+
+    for (int offset = threads_per_row >> 1; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset, threads_per_row);
+    }
+    float norm = __shfl_sync(0xffffffff, sum_sq > 0 ? sqrtf(sum_sq) : 1e-8f, 0, threads_per_row);
+    if (lane_in_row == 0) out_norms[row_id] = norm;
+    
+    const float* d_row = d + lane_in_row * 8;
+    #pragma unroll
+    for(int k=0; k<8; ++k) r[k] = (orig[k] * d_row[k]) / norm;
+
+    // Pass 1: FWHT
+    #pragma unroll
+    for(int step = 1; step <= 2; step <<= 1) {
+        #pragma unroll
+        for(int i = 0; i <= 4; i += 4) {
+            #pragma unroll
+            for(int j = 0; j < 4; ++j) {
+                if ((j & step) == 0) {
+                    float a = r[i + j]; float b = r[i + (j | step)];
+                    r[i + j] = a + b; r[i + (j | step)] = a - b;
+                }
+            }
+        }
+    }
+    for(int t_step = 1; t_step < threads_per_row; t_step <<= 1) {
+        #pragma unroll
+        for(int k = 0; k < 8; ++k) {
+            float other = __shfl_xor_sync(0xffffffff, r[k], t_step, threads_per_row);
+            if ((lane_in_row & t_step) == 0) r[k] = r[k] + other;
+            else r[k] = other - r[k];
+        }
+    }
+    #pragma unroll
+    for(int j = 0; j < 4; ++j) {
+        float a = r[j]; float b = r[j + 4];
+        r[j] = a + b; r[j + 4] = a - b;
+    }
+
     __shared__ half s_centroids[256][16];
-    __shared__ uint8_t s_p[128]; // Max 128 bytes
-    
-    int is_hbba = (active_mask >> layer_id) & 1;
 
-    // 1. Parallel Load Centroids to SRAM
-    for (int i = threadIdx.x; i < D * 16; i += blockDim.x) 
+    // Parallel load centroids to SRAM (V9.3: Block-wide parallel load)
+    for (int i = threadIdx.x; i < D * 16; i += blockDim.x) {
         s_centroids[i / 16][i % 16] = __float2half(centroids_table[i]);
-    
-    // 2. Load and Compute Norm
-    float sum_sq = 0;
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        float val = __half2float(x[row * D + i]);
-        s_row[i] = val;
-        sum_sq += val * val;
     }
-    for (int offset = 16; offset > 0; offset >>= 1) sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
-    float norm = sqrtf(sum_sq + 1e-8f);
-    if (threadIdx.x == 0) out_norms[row] = norm;
-    float inv_norm = 1.0f / norm;
-
-    // Initialize packing buffer
-    for (int i = threadIdx.x; i < 128; i += blockDim.x) s_p[i] = 0;
     __syncthreads();
 
-    // 3. HWHT for Projection (Quant Pass)
-    for (int i = threadIdx.x; i < D; i += blockDim.x) s_row[i] = (s_row[i] * inv_norm) * d_vec[i];
-    __syncthreads();
-
-    // In-place FWHT (Monolithic V9.6 compliant)
-    for (int len = 1; len < D; len <<= 1) {
-        for (int i = threadIdx.x; i < D; i += blockDim.x) {
-            int step = i / len;
-            if (step % 2 == 0) {
-                float a = s_row[i]; float b = s_row[i + len];
-                s_row[i] = a + b; s_row[i + len] = a - b;
-            }
-        }
-        __syncthreads();
-    }
-
+    // HBBA Quantize
     float f_scale = 1.0f / sqrtf((float)D);
-    float res_sum_sq = 0;
-
-    // 4. Quantize and Pack (SRAM)
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        float val = s_row[i] * f_scale;
-        int is_4bit = is_hbba && ((hbba_mask[i >> 5] >> (i & 31)) & 1);
-        int n_c = is_4bit ? 16 : 2;
+    #pragma unroll
+    for(int k = 0; k < 8; ++k) {
+        int element_idx = lane_in_row * 8 + k;
+        // Bit-Mask Lookup (0=1bit, 1=4bit)
+        int is_4bit = (hbba_mask[element_idx >> 5] >> (element_idx & 31)) & 1;
+        int n_centroids = is_4bit ? 16 : 2;
         
-        int best_c = 0; float min_dist = 1e18f;
-        for (int c = 0; c < n_c; ++c) {
-            float dist = fabsf(val - __half2float(s_centroids[i][c]));
-            if (dist < min_dist) { min_dist = dist; best_c = c; }
+        float projected = r[k] * f_scale;
+        uint8_t best_c = 0; float min_dist = 1e18f;
+        for(int c = 0; c < n_centroids; ++c) {
+            float dist = fabsf(projected - __half2float(s_centroids[element_idx][c]));
+            if (dist < min_dist) { min_dist = dist; best_c = (uint8_t)c; }
         }
-        
-        // Bit-Packing V10.0
-        if (is_hbba) { // Always use 4-bit layout if layer is HBBA
-            int byte_idx = i >> 1; // 2 per byte
-            int shift = (i & 1) ? 4 : 0;
-            atomicOr((unsigned int*)&s_p[byte_idx & ~3], (unsigned int)((best_c & 0xF) << (shift + (byte_idx & 3) * 8)));
-        } else {
-            int byte_idx = i >> 3; // 8 per byte
-            int shift = i & 7;
-            atomicOr((unsigned int*)&s_p[byte_idx & ~3], (unsigned int)((best_c & 0x1) << (shift + (byte_idx & 3) * 8)));
-        }
-
-        // Reconstruct local k to calc residual
-        float k_recon = __half2float(s_centroids[i][best_c]);
-        float diff = val - k_recon;
-        res_sum_sq += diff * diff;
-        s_row[i] = diff; // Store residual for Signs pass
+        out_idx[row_id * D + element_idx] = best_c;
+        r[k] = __half2float(s_centroids[element_idx][best_c]); 
     }
 
-    // 5. Final residual and HWHT (Signs)
-    for (int offset = 16; offset > 0; offset >>= 1) res_sum_sq += __shfl_xor_sync(0xffffffff, res_sum_sq, offset);
-    if (threadIdx.x == 0) {
-        out_r_norms[row] = sqrtf(res_sum_sq * D + 1e-8f); // Store residual norm
-        int max_j = is_hbba ? 128 : 32;
-        for (int j = 0; j < max_j; ++j) out_packed[row * max_j + j] = s_p[j];
-    }
-    __syncthreads();
-
-    // Signs HWHT (Parallel)
-    for (int len = 1; len < D; len <<= 1) {
-        for (int i = threadIdx.x; i < D; i += blockDim.x) {
-            int step = i / len;
-            if (step % 2 == 0) {
-                float a = s_row[i]; float b = s_row[i + len];
-                s_row[i] = a + b; s_row[i + len] = a - b;
+    // Pass 2: FWHT (Reconstruct)
+    #pragma unroll
+    for(int step = 1; step <= 2; step <<= 1) {
+        #pragma unroll
+        for(int i = 0; i <= 4; i += 4) {
+            #pragma unroll
+            for(int j = 0; j < 4; ++j) {
+                if ((j & step) == 0) {
+                    float a = r[i + j]; float b = r[i + (j | step)];
+                    r[i + j] = a + b; r[i + (j | step)] = a - b;
+                }
             }
         }
-        __syncthreads();
     }
-    for (int i = threadIdx.x; i < D; i += blockDim.x) out_signs[row * D + i] = __float2half(s_row[i]);
+    for(int t_step = 1; t_step < threads_per_row; t_step <<= 1) {
+        #pragma unroll
+        for(int k = 0; k < 8; ++k) {
+            float other = __shfl_xor_sync(0xffffffff, r[k], t_step, threads_per_row);
+            if ((lane_in_row & t_step) == 0) r[k] = r[k] + other;
+            else r[k] = other - r[k];
+        }
+    }
+    #pragma unroll
+    for(int j = 0; j < 4; ++j) {
+        float a = r[j]; float b = r[j + 4];
+        r[j] = a + b; r[j + 4] = a - b;
+    }
+
+    float b_scale = 1.0f / sqrtf((float)D); 
+    float m_base = b_scale * norm;
+    float res_sum_sq = 0.0f;
+    float* out_kmse_ptr = out_kmse + row_id * D + lane_in_row * 8;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float k_mse_val = r[i] * m_base * d_row[i];
+        out_kmse_ptr[i] = k_mse_val;
+        float diff = orig[i] - k_mse_val;
+        r[i] = diff * d_row[i]; 
+        res_sum_sq += diff * diff;
+    }
+    
+    for (int offset = threads_per_row >> 1; offset > 0; offset >>= 1) {
+        res_sum_sq += __shfl_down_sync(0xffffffff, res_sum_sq, offset, threads_per_row);
+    }
+    float r_norm = __shfl_sync(0xffffffff, res_sum_sq > 0 ? sqrtf(res_sum_sq) : 1e-8f, 0, threads_per_row);
+    if (lane_in_row == 0) out_r_norms[row_id] = r_norm;
+
+    // Pass 3: FWHT (Signs)
+    #pragma unroll
+    for(int step = 1; step <= 2; step <<= 1) {
+        #pragma unroll
+        for(int i = 0; i <= 4; i += 4) {
+            #pragma unroll
+            for(int j = 0; j < 4; ++j) {
+                if ((j & step) == 0) {
+                    float a = r[i + j]; float b = r[i + (j | step)];
+                    r[i + j] = a + b; r[i + (j | step)] = a - b;
+                }
+            }
+        }
+    }
+    for(int t_step = 1; t_step < threads_per_row; t_step <<= 1) {
+        #pragma unroll
+        for(int k = 0; k < 8; ++k) {
+            float other = __shfl_xor_sync(0xffffffff, r[k], t_step, threads_per_row);
+            if ((lane_in_row & t_step) == 0) r[k] = r[k] + other;
+            else r[k] = other - r[k];
+        }
+    }
+    #pragma unroll
+    for(int j = 0; j < 4; ++j) {
+        float a = r[j]; float b = r[j + 4];
+        r[j] = a + b; r[j + 4] = a - b;
+    }
+
+    half* out_half_signs = ((half*)out_signs) + row_id * D + lane_in_row * 8;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        out_half_signs[i] = __float2half(r[i]);
+    }
 }
 
-std::vector<torch::Tensor> ultra_fused_packed_hbba_fusion_cuda(
+std::vector<torch::Tensor> ultra_fused_hbba_fusion_cuda(
     torch::Tensor x, torch::Tensor d, torch::Tensor centroids_table, torch::Tensor mask,
     int layer_id, uint8_t active_mask) 
 {
-    const int N = x.size(0); const int D = x.size(1);
+    if (!((active_mask >> layer_id) & 1)) {
+        // Return dummy or handle baseline in Python
+    }
+    const int N = x.size(0);
+    const int D = x.size(1);
+    
     auto idx_options = torch::TensorOptions().dtype(torch::kUInt8).device(x.device());
     auto norm_options = torch::TensorOptions().dtype(torch::kFloat32).device(x.device());
     auto sign_options = torch::TensorOptions().dtype(torch::kFloat16).device(x.device());
 
-    int is_hbba = (active_mask >> layer_id) & 1;
-    int bytes_per_token = is_hbba ? 128 : 32;
-
-    torch::Tensor out_packed = torch::zeros({N, bytes_per_token}, idx_options);
+    torch::Tensor out_idx = torch::empty({N, D}, idx_options);
     torch::Tensor out_norms = torch::empty({N, 1}, norm_options);
-    torch::Tensor out_r_norms = torch::empty({N}, norm_options);
+    torch::Tensor out_kmse = torch::empty({N, D}, norm_options);
+    torch::Tensor out_r_norms = torch::empty({N, 1}, norm_options);
     torch::Tensor out_signs = torch::empty({N, D}, sign_options);
 
     at::cuda::CUDAGuard device_guard(x.device());
-    ultra_fused_packed_hbba_fusion_kernel<<<N, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (const half*)x.data_ptr<at::Half>(), d.data_ptr<float>(), centroids_table.data_ptr<float>(),
-        (const uint32_t*)mask.data_ptr<int>(), out_packed.data_ptr<uint8_t>(),
-        out_norms.data_ptr<float>(), out_r_norms.data_ptr<float>(),
-        (half*)out_signs.data_ptr<at::Half>(), layer_id, active_mask, D, N);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    dim3 threads(32); // row isolation
+    dim3 blocks(N); 
 
-    return {out_packed, out_norms, out_r_norms, out_signs};
+    ultra_fused_hbba_fusion_kernel<<<blocks, threads, 0, stream>>>(
+        (const half*)x.data_ptr<at::Half>(), 
+        d.data_ptr<float>(), 
+        centroids_table.data_ptr<float>(),
+        (const uint32_t*)mask.data_ptr<int>(),
+        out_idx.data_ptr<uint8_t>(), 
+        out_norms.data_ptr<float>(), 
+        out_kmse.data_ptr<float>(),
+        out_r_norms.data_ptr<float>(),
+        (half*)out_signs.data_ptr<at::Half>(),
+        D, N
+    );
+    return {out_idx, out_norms, out_kmse, out_r_norms, out_signs};
 }
 
 __global__ void hbba_calibrate_cuda_kernel(
@@ -692,31 +773,26 @@ torch::Tensor asymmetric_score_cuda(
     return out_scores;
 }
 
-__global__ void fused_asymmetric_attention_packed_kernel(
+__global__ void fused_asymmetric_attention_kernel(
     const half* __restrict__ q,       // [H, D]
-    const uint8_t* __restrict__ k_pc, // [H, S, 128] Packed Indices
+    const float* __restrict__ k_mse,   // [H, S, D]
     const half* __restrict__ signs,   // [H, S, D]
     const float* __restrict__ d_vec,   // [D]
-    const float* __restrict__ k_norms, // [H, S]
     const float* __restrict__ r_norms, // [H, S]
-    const float* __restrict__ centroids_table, // [D, 16]
     float* __restrict__ out_scores,   // [H, S]
-    int layer_id, uint8_t active_mask, int D, int S, int H, float scale) 
+    int D, int S, int H, float scale) 
 {
     int head_id = blockIdx.y;
-    if (head_id >= H) return;
+    if (head_id >= H) return; // UNIFORM: Entire block exits correctly
 
     __shared__ float s_q[256];
     __shared__ float s_q_proj[256];
-    __shared__ float s_centroids[256][16];
 
-    // 1. Shared Load Query, Diag & Centroids
+    // 1. Shared Load Query & Diag (per head)
     if (threadIdx.x < D) {
         float q_val = __half2float(q[head_id * D + threadIdx.x]);
         s_q[threadIdx.x] = q_val;
         s_q_proj[threadIdx.x] = q_val * d_vec[threadIdx.x];
-        #pragma unroll
-        for(int c=0; c<16; ++c) s_centroids[threadIdx.x][c] = centroids_table[threadIdx.x * 16 + c];
     }
     __syncthreads();
 
@@ -731,34 +807,24 @@ __global__ void fused_asymmetric_attention_packed_kernel(
         }
         __syncthreads();
     }
+    // SCALE FWHT: Match Python's fwht() orthonormal scale (1/sqrt(D))
     if (threadIdx.x < D) s_q_proj[threadIdx.x] *= (1.0f / sqrtf((float)D));
     __syncthreads();
 
-    // 3. Scoring (Packed bitstream reconstruction)
+    // 3. Scoring (head-specific keys)
     int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
-    if (row >= S) return;
+    if (row >= S) return; 
 
-    int is_hbba = (active_mask >> layer_id) & 1;
     int lane = threadIdx.x % 32;
     float sum1 = 0; float sum2 = 0;
     
-    // Offset packed indices by [head_id, row]
-    const uint8_t* my_k_packed = k_pc + (size_t)(head_id * S + row) * (is_hbba ? 128 : 32);
-    const half* my_signs = signs + (size_t)(head_id * S + row) * D;
-    float k_norm = k_norms[head_id * S + row];
+    const float* my_k_mse = k_mse + (head_id * S + (size_t)row) * D;
+    const half* my_signs = signs + (head_id * S + (size_t)row) * D;
 
     #pragma unroll
     for (int i = lane; i < D; i += 32) {
-        int val = 0;
-        if (is_hbba) {
-            val = (my_k_packed[i >> 1] >> ((i & 1) ? 4 : 0)) & 0xF;
-        } else {
-            val = (my_k_packed[i >> 3] >> (i & 7)) & 0x1;
-        }
-        
-        float k_recon = s_centroids[i][val] * k_norm;
-        sum1 += s_q_proj[i] * k_recon;
-        sum2 += s_q[i] * __half2float(my_signs[i]);
+        sum1 += s_q[i] * my_k_mse[i];
+        sum2 += s_q_proj[i] * __half2float(my_signs[i]);
     }
 
     // Intra-warp reduction
@@ -768,17 +834,17 @@ __global__ void fused_asymmetric_attention_packed_kernel(
     }
 
     if (lane == 0) {
-        out_scores[head_id * S + row] = sum1 + k_norm * scale * sum2 * r_norms[head_id * S + row];
+        out_scores[head_id * S + row] = sum1 + scale * sum2 * r_norms[head_id * S + row];
     }
 }
 
-torch::Tensor fused_asymmetric_attention_packed_cuda(
-    torch::Tensor q, torch::Tensor k_packed, torch::Tensor signs, 
-    torch::Tensor d_vec, torch::Tensor k_norms, torch::Tensor r_norms, 
-    torch::Tensor centroids, int layer_id, uint8_t active_mask, float scale) 
+torch::Tensor fused_asymmetric_attention_cuda(
+    torch::Tensor q, torch::Tensor k_mse, torch::Tensor signs, 
+    torch::Tensor d_vec, torch::Tensor r_norms, float scale) 
 {
+    // Shapes: q[H, D], k_mse[H, S, D], signs[H, S, D], r_norms[H, S]
     int H = q.size(0); int D = q.size(1);
-    int S = k_norms.size(1);
+    int S = k_mse.size(1);
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(q.device());
     torch::Tensor out_scores = torch::empty({H, S}, options);
 
@@ -787,18 +853,19 @@ torch::Tensor fused_asymmetric_attention_packed_cuda(
     dim3 blocks((S + (threads_x / 32) - 1) / (threads_x / 32), H);
     dim3 threads(threads_x);
 
-    fused_asymmetric_attention_packed_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (const half*)q.data_ptr<at::Half>(), k_packed.data_ptr<uint8_t>(), (const half*)signs.data_ptr<at::Half>(),
-        d_vec.data_ptr<float>(), k_norms.data_ptr<float>(), r_norms.data_ptr<float>(),
-        centroids.data_ptr<float>(), out_scores.data_ptr<float>(),
-        layer_id, active_mask, D, S, H, scale
+    fused_asymmetric_attention_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        (const half*)q.data_ptr<at::Half>(), k_mse.data_ptr<float>(), (const half*)signs.data_ptr<at::Half>(),
+        d_vec.data_ptr<float>(), r_norms.data_ptr<float>(), out_scores.data_ptr<float>(), D, S, H, scale
     );
     return out_scores;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &fwht_cuda_forward, "KudaHitam Forward FWHT");
-    m.def("ultra_fused_hbba_fusion", &ultra_fused_packed_hbba_fusion_cuda, "Zero-Materialization Encoder V10.0");
+    m.def("ultra_fused_full_fusion", &ultra_fused_full_fusion_cuda, "God Kernel V8.3");
+    m.def("ultra_fused_hbba_fusion", &ultra_fused_hbba_fusion_cuda, "HBBA God Kernel V8.5");
     m.def("hbba_calibrate_cuda", &hbba_calibrate_cuda, "Atomic HBBA Calibrator V8.7");
-    m.def("fused_asymmetric_attention", &fused_asymmetric_attention_packed_cuda, "Zero-Materialization Decoder V10.0");
+    m.def("packed_hbba_fusion", &packed_hbba_fusion_cuda, "Symmetry Nexus Encoder V9.4");
+    m.def("asymmetric_score_cuda", &asymmetric_score_cuda, "Symmetry Nexus Scorer V9.4");
+    m.def("fused_asymmetric_attention", &fused_asymmetric_attention_cuda, "Zero-HBM Fused Attn V9.4");
 }
