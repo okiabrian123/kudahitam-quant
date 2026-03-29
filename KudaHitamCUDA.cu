@@ -766,7 +766,7 @@ __global__ void fused_asymmetric_attention_packed_kernel(
     }
 
     if (lane == 0) {
-        out_scores[head_id * S + row] = sum1 + scale * sum2 * r_norms[head_id * S + row];
+        out_scores[head_id * S + row] = sum1 + k_norm * scale * sum2 * r_norms[head_id * S + row];
     }
 }
 
