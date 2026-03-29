@@ -385,8 +385,8 @@ class KudahitamCompressorV2:
         
         # Reshape for multi-head Grid-Parallel Scoring (V10.2)
         q_flat = queries.view(B*H, D).half().contiguous()
-        # V10.0: Unified 128-byte layout
-        k_flat = k_packed.view(B*H, S, 128).contiguous()
+        # Non-HBBA uses 32-byte layout (1-bit)
+        k_flat = k_packed.view(B*H, S, 32).contiguous()
         s_flat = signs.view(B*H, S, D).contiguous()
         n_flat = k_norms.view(B*H, S).contiguous()
         rn_flat = r_norms.view(B*H, S).contiguous()
@@ -527,8 +527,10 @@ class KudahitamCompressorHBBA:
         
         # Reshape for multi-head Grid-Parallel Scoring
         q_flat = queries.view(B*H, D).half().contiguous()
-        # V10.0: Unified 128-byte layout
-        k_flat = k_packed.view(B*H, S, 128).contiguous()
+        # Note: indices size depends on HBBA mode [B*H, S, 128 or 32]
+        is_hbba = (self.active_mask >> self.layer_id) & 1
+        bytes_per_token = 128 if is_hbba else 32
+        k_flat = k_packed.view(B*H, S, bytes_per_token).contiguous()
         s_flat = signs.view(B*H, S, D).contiguous()
         n_flat = k_norms.view(B*H, S).contiguous()
         rn_flat = r_norms.view(B*H, S).contiguous()

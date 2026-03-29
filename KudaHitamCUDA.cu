@@ -375,7 +375,8 @@ __global__ void ultra_fused_packed_hbba_fusion_kernel(
     for (int offset = 16; offset > 0; offset >>= 1) res_sum_sq += __shfl_xor_sync(0xffffffff, res_sum_sq, offset);
     if (threadIdx.x == 0) {
         out_r_norms[row] = sqrtf(res_sum_sq * D + 1e-8f); // Store residual norm
-        for (int j = 0; j < 128; ++j) out_packed[row * 128 + j] = s_p[j];
+        int max_j = is_hbba ? 128 : 32;
+        for (int j = 0; j < max_j; ++j) out_packed[row * max_j + j] = s_p[j];
     }
     __syncthreads();
 
@@ -402,7 +403,10 @@ std::vector<torch::Tensor> ultra_fused_packed_hbba_fusion_cuda(
     auto norm_options = torch::TensorOptions().dtype(torch::kFloat32).device(x.device());
     auto sign_options = torch::TensorOptions().dtype(torch::kFloat16).device(x.device());
 
-    torch::Tensor out_packed = torch::zeros({N, 128}, idx_options);
+    int is_hbba = (active_mask >> layer_id) & 1;
+    int bytes_per_token = is_hbba ? 128 : 32;
+
+    torch::Tensor out_packed = torch::zeros({N, bytes_per_token}, idx_options);
     torch::Tensor out_norms = torch::empty({N, 1}, norm_options);
     torch::Tensor out_r_norms = torch::empty({N}, norm_options);
     torch::Tensor out_signs = torch::empty({N, D}, sign_options);
