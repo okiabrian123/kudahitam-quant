@@ -458,7 +458,8 @@ __global__ void ultra_fused_hbba_fusion_kernel(
     half* out_half_signs = ((half*)out_signs) + row_id * D + lane_in_row * 8;
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        out_half_signs[i] = __float2half(r[i]);
+        // V10: True 1-bit Residual Sign Extraction
+        out_half_signs[i] = __float2half( (r[i] >= 0.0f) ? 1.0f : -1.0f );
     }
 }
 
