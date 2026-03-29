@@ -573,7 +573,7 @@ def main():
             for s_name, b_count, d_set, use_out, d_p, o_bits, f_set in strategies:
                 res_row = {}; mem_total = 0
                 for ver in ["V2", "Gaussian"]:
-                    if "HBBA" in s_name and ver == "Gaussian":
+                    if "1.16-bit" in s_name and ver == "Gaussian":
                         res_row[ver] = {"acc": 0.0, "ms": 0.0}; continue
                         
                     CompClass = KudahitamCompressorV2 if ver == "V2" else KudahitamCompressorGaussian; cos_l, comp_l = [], []
