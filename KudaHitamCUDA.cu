@@ -5,10 +5,9 @@
 #include <ATen/cuda/CUDAContext.h>
 
 /**
- * KudaHitam FWHT - Gila Mode V7.6 (Native FP16 Engine)
+ * KudaHitam FWHT - Symmetry Nexus V9.4 (Fused Decoding Engine)
  * Monolithic: FP16 Input -> Registers -> Quant -> Reconstruction -> FP16 Output
- * Formula: Out = FWHT(LloydMax(FWHT(X_norm * D), centroids)) * D * ||X||
- * Bypasses Python-level FP16->FP32 casting floor.
+ * Innovation: LDS Shared Centroid Cache + Fused Asymmetric Attention Scoring
  */
 
 __global__ void ultra_fused_full_fusion_kernel_v8(
